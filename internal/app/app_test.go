@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/akundu/odh-pr-deploy/internal/core"
 )
 
 func TestCSVImageVariablesFindsBothRequiredInputs(t *testing.T) {
@@ -95,5 +97,33 @@ func TestDeployChangesBothImagesInOneGuardedCSVTransaction(t *testing.T) {
 	joined := strings.Join(r.calls, "\n")
 	if !strings.Contains(joined, "odh-dashboard@sha256:") || !strings.Contains(joined, "odh-mod-arch-gen-ai@sha256:") {
 		t.Fatalf("CSV patch omitted a stack image: %s", joined)
+	}
+}
+
+type cleanupRunner struct{ calls []string }
+
+func (r *cleanupRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+	call := name + " " + strings.Join(args, " ")
+	r.calls = append(r.calls, call)
+	if strings.Contains(call, "get csv rhods.v1") {
+		return []byte(`{"metadata":{"resourceVersion":"7"},"spec":{"install":{"spec":{"deployments":[{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"RELATED_IMAGE_ODH_DASHBOARD_IMAGE","value":"dashboard-old"},{"name":"RELATED_IMAGE_ODH_MOD_ARCH_GEN_AI_IMAGE","value":"genai-old"}]}]}}}}]}}}}`), nil
+	}
+	return nil, nil
+}
+func TestCleanupAlreadyRestoredRemovesOnlyItsAnnotation(t *testing.T) {
+	r := &cleanupRunner{}
+	tool := New(r, t.TempDir())
+	s := Session{ID: "genai-stack-1234567890abcdef", Context: "ctx", CSVNamespace: "operators", CSVName: "rhods.v1", Annotation: "odh-pr-deploy.openshift.io/reconcile-test", Overrides: []core.ImageOverride{
+		{Component: core.Component{Name: "gen-ai", ImageEnv: "RELATED_IMAGE_ODH_MOD_ARCH_GEN_AI_IMAGE"}, Image: "genai-new", OriginalCSVValue: "genai-old"},
+		{Component: core.Component{Name: "dashboard", ImageEnv: "RELATED_IMAGE_ODH_DASHBOARD_IMAGE"}, Image: "dashboard-new", OriginalCSVValue: "dashboard-old"},
+	}}
+	if err := tool.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := tool.Cleanup(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(r.calls, "\n"), "annotate datasciencecluster default-dsc odh-pr-deploy.openshift.io/reconcile-test-") {
+		t.Fatal("cleanup left the tool annotation after an already-restored stack")
 	}
 }

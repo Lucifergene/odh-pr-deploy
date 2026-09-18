@@ -183,6 +183,9 @@ func (t *Tool) Cleanup(ctx context.Context, id string) error {
 		desired = desired && v.Value == x.Image
 	}
 	if original {
+		if _, e = t.oc(ctx, s.Context, "", "annotate", "datasciencecluster", "default-dsc", s.Annotation+"-"); e != nil {
+			return e
+		}
 		s.Completed = true
 		return t.Save(s)
 	}
