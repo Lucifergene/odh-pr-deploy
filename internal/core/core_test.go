@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -123,5 +124,68 @@ func TestSanitizeShadowDeployment(t *testing.T) {
 	containers := template["spec"].(map[string]any)["containers"].([]any)
 	if containers[0].(map[string]any)["image"] != "quay.io/example:pr" || template["spec"].(map[string]any)["serviceAccountName"] != "preserve-me" {
 		t.Fatalf("shadow image or workload fields not preserved: %#v", template)
+	}
+}
+
+func TestLiveRoutePatchTargetsOnlyTheClonedDashboardService(t *testing.T) {
+	patch, err := LiveRoutePatch("rhods-dashboard-pr-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []map[string]any
+	if err := json.Unmarshal(patch, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0]["path"] != "/spec/rules/0/backendRefs/0/name" || got[0]["value"] != "rhods-dashboard-pr-session" {
+		t.Fatalf("unexpected route patch: %#v", got)
+	}
+}
+
+func TestStackServiceSelectorIncludesWorkloadIdentity(t *testing.T) {
+	manifest, err := StackServiceManifest([]byte(`{"metadata":{"name":"source"},"spec":{"selector":{"app":"source"},"ports":[{"port":8143}]}}`), "clone", "session", "gen-ai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(manifest, &got); err != nil {
+		t.Fatal(err)
+	}
+	selector := got["spec"].(map[string]any)["selector"].(map[string]any)
+	if len(selector) != 2 || selector[SessionLabel] != "session" || selector[WorkloadLabel] != "gen-ai" {
+		t.Fatalf("selector can overlap a different clone: %#v", selector)
+	}
+}
+
+func TestSetContainerEnvReplacesOnlyRequestedGatewayDomain(t *testing.T) {
+	input := []byte(`{"spec":{"template":{"spec":{"containers":[{"name":"rhods-dashboard","env":[{"name":"GATEWAY_DOMAIN","value":"rh-ai.apps.example.com"},{"name":"KEEP","value":"unchanged"}]},{"name":"sidecar","env":[{"name":"GATEWAY_DOMAIN","value":"sidecar.example.com"}]}]}}}}`)
+	manifest, err := SetContainerEnv(input, "rhods-dashboard", "GATEWAY_DOMAIN", "test.apps.example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(manifest, &got); err != nil {
+		t.Fatal(err)
+	}
+	containers := got["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any)
+	dashboardEnv := containers[0].(map[string]any)["env"].([]any)
+	if dashboardEnv[0].(map[string]any)["value"] != "test.apps.example.com" || dashboardEnv[1].(map[string]any)["value"] != "unchanged" {
+		t.Fatalf("dashboard env was not updated precisely: %#v", dashboardEnv)
+	}
+	if containers[1].(map[string]any)["env"].([]any)[0].(map[string]any)["value"] != "sidecar.example.com" {
+		t.Fatalf("unrelated container was modified: %#v", containers[1])
+	}
+}
+
+func TestAddPassthroughProviderPreservesExistingInferenceProviders(t *testing.T) {
+	input := "providers:\n  inference:\n  - provider_id: endpoint-1\n    provider_type: remote::openai\n  vector_io:\n  - provider_id: pgvector\n"
+	got, err := AddPassthroughProvider(input, "https://rh-ai.example.com/gen-ai/api/v1/genai-proxy/ns/project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "provider_id: endpoint-1") || !strings.Contains(got, "provider_id: genai-bff-proxy") || !strings.Contains(got, "provider_type: remote::passthrough") {
+		t.Fatalf("provider was not added without preserving existing entries: %s", got)
+	}
+	if strings.Index(got, "provider_id: genai-bff-proxy") > strings.Index(got, "  vector_io:") {
+		t.Fatalf("provider was added to the wrong YAML section: %s", got)
 	}
 }

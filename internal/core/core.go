@@ -7,6 +7,7 @@ import (
 )
 
 const SessionLabel = "odh-pr-deploy.opendatahub.io/session"
+const WorkloadLabel = "odh-pr-deploy.opendatahub.io/workload"
 
 // Component describes the operator-owned dashboard workload whose image may be tested.
 type Component struct {
@@ -14,6 +15,7 @@ type Component struct {
 	Deployment string `json:"deployment"`
 	Container  string `json:"container"`
 	ImageEnv   string `json:"imageEnv"`
+	Service    string `json:"service"`
 }
 
 var components = map[string]Component{
@@ -22,6 +24,7 @@ var components = map[string]Component{
 		Deployment: "gen-ai-ui",
 		Container:  "gen-ai-ui",
 		ImageEnv:   "RELATED_IMAGE_ODH_MOD_ARCH_GEN_AI_IMAGE",
+		Service:    "odh-dashboard-gen-ai-ui",
 	},
 }
 
@@ -71,7 +74,231 @@ type Session struct {
 	ClusterVersion     string        `json:"clusterVersion"`
 	RHOAIVersion       string        `json:"rhoaiVersion"`
 	ShadowDeployment   string        `json:"shadowDeployment,omitempty"`
+	Resources          []string      `json:"resources,omitempty"`
+	URL                string        `json:"url,omitempty"`
+	HostImage          string        `json:"hostImage,omitempty"`
+	OperatorReplicas   *int32        `json:"operatorReplicas,omitempty"`
+	RouteTarget        string        `json:"routeTarget,omitempty"`
+	OGXConfigNamespace string        `json:"ogxConfigNamespace,omitempty"`
+	OGXConfigName      string        `json:"ogxConfigName,omitempty"`
+	OGXConfigOriginal  string        `json:"ogxConfigOriginal,omitempty"`
+	OGXConfigPatched   string        `json:"ogxConfigPatched,omitempty"`
 	Completed          bool          `json:"completed"`
+}
+
+// AddPassthroughProvider adds the Responses API provider without disturbing
+// existing providers or registered models. The caller retains both documents
+// so cleanup can restore the exact original ConfigMap value.
+func AddPassthroughProvider(config, baseURL string) (string, error) {
+	if baseURL == "" {
+		return "", fmt.Errorf("passthrough base URL is required")
+	}
+	if strings.Contains(config, "provider_id: genai-bff-proxy") {
+		return config, nil
+	}
+	marker := "\n  vector_io:"
+	at := strings.Index(config, marker)
+	if at < 0 {
+		return "", fmt.Errorf("Llama Stack config has no inference provider boundary")
+	}
+	provider := "\n  - provider_id: genai-bff-proxy\n    provider_type: remote::passthrough\n    config:\n      base_url: " + baseURL + "\n      api_key: \"\"\n      forward_headers:\n        maas_subscription: X-MaaS-Subscription\n        inference_model_source_type: X-Inference-Model-Source-Type\n"
+	return config[:at] + provider + config[at:], nil
+}
+
+// LiveRoutePatch changes exactly one field on the existing gateway route.
+func LiveRoutePatch(service string) ([]byte, error) {
+	if service == "" {
+		return nil, fmt.Errorf("route service is required")
+	}
+	return json.Marshal([]map[string]any{{"op": "replace", "path": "/spec/rules/0/backendRefs/0/name", "value": service}})
+}
+
+// StackManifest returns a controller-independent copy of a Service. Its selector is
+// narrowed with the session label so it cannot select production pods.
+func StackServiceManifest(data []byte, name, session, workload string) ([]byte, error) {
+	var object map[string]any
+	if err := json.Unmarshal(data, &object); err != nil {
+		return nil, fmt.Errorf("parse service: %w", err)
+	}
+	metadata, ok := object["metadata"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("service metadata is required")
+	}
+	metadata["name"] = name
+	for _, key := range []string{"uid", "resourceVersion", "creationTimestamp", "generation", "managedFields", "ownerReferences", "annotations"} {
+		delete(metadata, key)
+	}
+	ensureMap(metadata, "labels")[SessionLabel] = session
+	delete(object, "status")
+	spec, ok := object["spec"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("service spec is required")
+	}
+	for _, key := range []string{"clusterIP", "clusterIPs", "ipFamilies", "ipFamilyPolicy", "healthCheckNodePort"} {
+		delete(spec, key)
+	}
+	// Replace, rather than extend, the production selector. Extending it would
+	// leave a clone eligible for the production Service selector.
+	spec["selector"] = map[string]any{SessionLabel: session, WorkloadLabel: workload}
+	return json.Marshal(object)
+}
+
+// AddWorkloadLabel makes the cloned deployment and its pod selector unique
+// within a session, so sibling cloned Services cannot select one another.
+func AddWorkloadLabel(manifest []byte, workload string) ([]byte, error) {
+	var object map[string]any
+	if err := json.Unmarshal(manifest, &object); err != nil {
+		return nil, err
+	}
+	spec, ok := object["spec"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("deployment spec is required")
+	}
+	selector := ensureMap(spec, "selector")
+	ensureMap(selector, "matchLabels")[WorkloadLabel] = workload
+	template, ok := spec["template"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("deployment pod template is required")
+	}
+	ensureMap(ensureMap(template, "metadata"), "labels")[WorkloadLabel] = workload
+	return json.Marshal(object)
+}
+
+// SetContainerEnv changes one literal environment value on the named container.
+// Stack deployments use it to give their cloned Dashboard a test-specific public
+// hostname without changing the managed Dashboard configuration.
+func SetContainerEnv(manifest []byte, containerName, variable, value string) ([]byte, error) {
+	var object map[string]any
+	if err := json.Unmarshal(manifest, &object); err != nil {
+		return nil, fmt.Errorf("parse deployment: %w", err)
+	}
+	spec, ok := object["spec"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("deployment spec is required")
+	}
+	template, ok := spec["template"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("deployment template is required")
+	}
+	podSpec, ok := template["spec"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("pod spec is required")
+	}
+	containers, ok := podSpec["containers"].([]any)
+	if !ok {
+		return nil, fmt.Errorf("deployment containers are required")
+	}
+	for _, item := range containers {
+		container, ok := item.(map[string]any)
+		if !ok || container["name"] != containerName {
+			continue
+		}
+		env, ok := container["env"].([]any)
+		if !ok {
+			return nil, fmt.Errorf("container %q has no environment entries", containerName)
+		}
+		for _, envItem := range env {
+			entry, ok := envItem.(map[string]any)
+			if ok && entry["name"] == variable {
+				entry["value"] = value
+				delete(entry, "valueFrom")
+				return json.Marshal(object)
+			}
+		}
+		return nil, fmt.Errorf("container %q has no %s environment entry", containerName, variable)
+	}
+	return nil, fmt.Errorf("container %q not found", containerName)
+}
+
+// StackFederationManifest clones the runtime federation configuration and directs
+// only the cloned host's GenAI and core-BFF requests at the cloned Services.
+func StackFederationManifest(data []byte, name, session, componentService, dashboardService string) ([]byte, error) {
+	var object map[string]any
+	if err := json.Unmarshal(data, &object); err != nil {
+		return nil, fmt.Errorf("parse federation configmap: %w", err)
+	}
+	metadata, ok := object["metadata"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("configmap metadata is required")
+	}
+	metadata["name"] = name
+	for _, key := range []string{"uid", "resourceVersion", "creationTimestamp", "generation", "managedFields", "ownerReferences", "annotations"} {
+		delete(metadata, key)
+	}
+	ensureMap(metadata, "labels")[SessionLabel] = session
+	dataMap, ok := object["data"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("configmap data is required")
+	}
+	raw, ok := dataMap["module-federation-config.json"].(string)
+	if !ok {
+		return nil, fmt.Errorf("module-federation-config.json is required")
+	}
+	var entries []map[string]any
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return nil, fmt.Errorf("parse federation config: %w", err)
+	}
+	for _, entry := range entries {
+		name, _ := entry["name"].(string)
+		if name != "genAi" && name != "coreBff" {
+			continue
+		}
+		for _, key := range []string{"service", "proxyService"} {
+			items, ok := entry[key].([]any)
+			if !ok {
+				continue
+			}
+			for _, item := range items {
+				if route, ok := item.(map[string]any); ok {
+					if service, ok := route["service"].(map[string]any); ok && name == "coreBff" {
+						service["name"] = dashboardService
+					}
+				}
+			}
+		}
+		if service, ok := entry["service"].(map[string]any); ok && name == "genAi" {
+			service["name"] = componentService
+		}
+	}
+	updated, err := json.Marshal(entries)
+	if err != nil {
+		return nil, err
+	}
+	dataMap["module-federation-config.json"] = string(updated)
+	return json.Marshal(object)
+}
+
+func StackRouteManifest(name, namespace, session, hostname, service string) ([]byte, error) {
+	if hostname == "" {
+		return nil, fmt.Errorf("route hostname is required")
+	}
+	return json.Marshal(map[string]any{
+		"apiVersion": "gateway.networking.k8s.io/v1",
+		"kind":       "HTTPRoute",
+		"metadata":   map[string]any{"name": name, "namespace": namespace, "labels": map[string]string{SessionLabel: session}},
+		"spec": map[string]any{
+			"hostnames":  []string{hostname},
+			"parentRefs": []any{map[string]any{"group": "gateway.networking.k8s.io", "kind": "Gateway", "name": "data-science-gateway", "namespace": "openshift-ingress"}},
+			"rules": []any{map[string]any{
+				"matches":     []any{map[string]any{"path": map[string]any{"type": "PathPrefix", "value": "/"}}},
+				"backendRefs": []any{map[string]any{"group": "", "kind": "Service", "name": service, "port": 8443, "weight": 1}},
+			}},
+		},
+	})
+}
+
+// StackIngressRouteManifest bridges a public wildcard host to the existing
+// authenticated data-science Gateway. It is a new Route only; no gateway-owned
+// Route, Service, or policy is changed.
+func StackIngressRouteManifest(name, session, hostname string) ([]byte, error) {
+	if hostname == "" {
+		return nil, fmt.Errorf("ingress route hostname is required")
+	}
+	return json.Marshal(map[string]any{
+		"apiVersion": "route.openshift.io/v1", "kind": "Route",
+		"metadata": map[string]any{"name": name, "namespace": "openshift-ingress", "labels": map[string]string{SessionLabel: session}},
+		"spec":     map[string]any{"host": hostname, "to": map[string]any{"kind": "Service", "name": "data-science-gateway-data-science-gateway-class", "weight": 100}, "port": map[string]any{"targetPort": 443}, "tls": map[string]any{"termination": "reencrypt", "insecureEdgeTerminationPolicy": "Redirect"}},
+	})
 }
 
 func MarshalSession(session Session) ([]byte, error) { return json.MarshalIndent(session, "", "  ") }
@@ -224,17 +451,15 @@ func ShadowManifest(data []byte, name, container, image, session string) ([]byte
 	if !ok {
 		return nil, fmt.Errorf("deployment spec is required")
 	}
-	selector := ensureMap(spec, "selector")
-	matchLabels := ensureMap(selector, "matchLabels")
-	matchLabels[SessionLabel] = session
+	spec["selector"] = map[string]any{"matchLabels": map[string]any{SessionLabel: session}}
 	template, ok := spec["template"].(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("deployment pod template is required")
 	}
 	templateMetadata := ensureMap(template, "metadata")
-	templateLabels := ensureMap(templateMetadata, "labels")
-	delete(templateLabels, "platform.opendatahub.io/part-of")
-	templateLabels[SessionLabel] = session
+	// Do not retain workload selector labels (for example deployment=gen-ai-ui):
+	// production Services must never be able to select this test pod.
+	templateMetadata["labels"] = map[string]any{SessionLabel: session}
 	templateSpec, ok := template["spec"].(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("deployment pod spec is required")

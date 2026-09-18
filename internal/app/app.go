@@ -36,9 +36,10 @@ type Tool struct {
 func New(runner Runner, stateDir string) *Tool { return &Tool{runner: runner, stateDir: stateDir} }
 
 type DeployOptions struct {
-	Context, Namespace, Component, Image, Mode string
-	PR                                         int
-	AllowManaged                               bool
+	Context, Namespace, Component, Image, Mode, HostImage string
+	PR                                                    int
+	AllowManaged                                          bool
+	AllowLive                                             bool
 }
 
 type Session = core.Session
@@ -120,13 +121,16 @@ func (t *Tool) Deploy(ctx context.Context, options DeployOptions) (Session, erro
 		return Session{}, fmt.Errorf("--context, --namespace, and --component are required")
 	}
 	if options.Mode == "" {
-		options.Mode = "shadow"
+		options.Mode = "stack"
 	}
-	if options.Mode != "shadow" && options.Mode != "managed" {
+	if options.Mode != "shadow" && options.Mode != "managed" && options.Mode != "stack" && options.Mode != "live" {
 		return Session{}, fmt.Errorf("unsupported mode %q", options.Mode)
 	}
 	if options.Mode == "managed" && !options.AllowManaged {
 		return Session{}, fmt.Errorf("managed updates require --allow-managed-update")
+	}
+	if options.Mode == "live" && !options.AllowLive {
+		return Session{}, fmt.Errorf("live traffic switching requires --allow-live-traffic")
 	}
 	component, err := core.ComponentFor(options.Component)
 	if err != nil {
@@ -192,6 +196,9 @@ func (t *Tool) Deploy(ctx context.Context, options DeployOptions) (Session, erro
 		}
 		return session, nil
 	}
+	if options.Mode == "stack" || options.Mode == "live" {
+		return t.deployStack(ctx, options, component, image, deploymentJSON, session, options.Mode == "live")
+	}
 
 	if ok, err := t.canPatch(ctx, options.Context, options.Namespace); err != nil || !ok {
 		return Session{}, fmt.Errorf("managed update requires patch deployments permission: %w", err)
@@ -241,6 +248,86 @@ func (t *Tool) Cleanup(ctx context.Context, id string) error {
 		session.Completed = true
 		return t.Save(session)
 	}
+	if session.Mode == "stack" || session.Mode == "live" {
+		if session.OGXConfigPatched != "" {
+			configMap, err := t.oc(ctx, session.Context, session.OGXConfigNamespace, "get", "configmap", session.OGXConfigName, "-o", "json")
+			if err != nil {
+				return err
+			}
+			current, err := configMapYAML(configMap)
+			if err != nil {
+				return err
+			}
+			if current != session.OGXConfigPatched && current != session.OGXConfigOriginal {
+				return fmt.Errorf("refusing OGX cleanup: ConfigMap changed outside this session")
+			}
+			if current == session.OGXConfigPatched {
+				if err := t.patchConfigMapYAML(ctx, session.Context, session.OGXConfigNamespace, session.OGXConfigName, session.OGXConfigOriginal); err != nil {
+					return err
+				}
+				if _, err := t.oc(ctx, session.Context, session.OGXConfigNamespace, "delete", "pod", "-l", "ogx.io/server=lsd-genai-playground"); err != nil {
+					return err
+				}
+			}
+		}
+		if session.Mode == "live" {
+			currentRoute, err := t.oc(ctx, session.Context, session.Namespace, "get", "httproute", "rhods-dashboard", "-o", "json")
+			if err != nil {
+				return err
+			}
+			currentTarget, err := routeTarget(currentRoute)
+			if err != nil {
+				return err
+			}
+			expected := "rhods-dashboard-pr-" + strings.ReplaceAll(strings.TrimPrefix(session.ID, session.Component.Name+"-"), "t", "")
+			if currentTarget != session.RouteTarget && currentTarget != expected {
+				return fmt.Errorf("refusing live cleanup: gateway route changed outside session to %q", currentTarget)
+			}
+			if currentTarget == expected {
+				patch, err := core.LiveRoutePatch(session.RouteTarget)
+				if err != nil {
+					return err
+				}
+				if _, err = t.oc(ctx, session.Context, session.Namespace, "patch", "httproute", "rhods-dashboard", "--type=json", "-p", string(patch)); err != nil {
+					return err
+				}
+			}
+			if session.OperatorReplicas != nil {
+				if _, err := t.oc(ctx, session.Context, session.Namespace, "scale", "deployment", "dashboard-operator", "--replicas="+fmt.Sprint(*session.OperatorReplicas)); err != nil {
+					return err
+				}
+				if _, err := t.oc(ctx, session.Context, session.Namespace, "rollout", "status", "deployment/dashboard-operator", "--timeout=10m"); err != nil {
+					return err
+				}
+			}
+		}
+		current, err := t.oc(ctx, session.Context, session.Namespace, "get", "deployment", session.Component.Deployment, "-o", "json")
+		if err != nil {
+			return err
+		}
+		image, err := deploymentImage(current, session.Component.Container)
+		if err != nil {
+			return err
+		}
+		if image != session.OriginalImage {
+			return fmt.Errorf("refusing stack cleanup: managed deployment image changed from %q to %q", session.OriginalImage, image)
+		}
+		for _, resource := range session.Resources {
+			namespace, target := session.Namespace, resource
+			if parts := strings.SplitN(resource, "|", 2); len(parts) == 2 {
+				namespace, target = parts[0], parts[1]
+			}
+			parts := strings.SplitN(target, "/", 2)
+			if len(parts) != 2 {
+				return fmt.Errorf("invalid recorded resource %q", resource)
+			}
+			if _, err := t.oc(ctx, session.Context, namespace, "delete", parts[0], parts[1], "--ignore-not-found"); err != nil {
+				return err
+			}
+		}
+		session.Completed = true
+		return t.Save(session)
+	}
 	managedJSON, err := t.oc(ctx, session.Context, session.Namespace, "get", "deployment", session.Component.Deployment, "-o", "json")
 	if err != nil {
 		return err
@@ -281,6 +368,127 @@ func (t *Tool) Cleanup(ctx context.Context, id string) error {
 		return fmt.Errorf("restore verification failed: got image %q, want %q", image, session.OriginalImage)
 	}
 	session.Completed = true
+	return t.Save(session)
+}
+
+// PrepareOGXPassthrough makes an existing project’s OGX configuration usable
+// with the Responses API. Its exact previous value is session-persisted before
+// the patch, and Cleanup refuses to overwrite a concurrent change.
+func (t *Tool) PrepareOGXPassthrough(ctx context.Context, id, project string) error {
+	session, err := t.Load(id)
+	if err != nil {
+		return err
+	}
+	if session.Mode != "live" {
+		return fmt.Errorf("OGX preparation requires a live session")
+	}
+	if project == "" {
+		return fmt.Errorf("--project is required")
+	}
+	configMap, err := t.oc(ctx, session.Context, project, "get", "configmap", "llama-stack-config", "-o", "json")
+	if err != nil {
+		return err
+	}
+	original, err := configMapYAML(configMap)
+	if err != nil {
+		return err
+	}
+	baseURL := "https://rh-ai.apps.rosa.akundu-cluster.vbry.p3.openshiftapps.com/gen-ai/api/v1/genai-proxy/ns/" + project
+	patched, err := core.AddPassthroughProvider(original, baseURL)
+	if err != nil {
+		return err
+	}
+	if session.OGXConfigPatched != "" {
+		return fmt.Errorf("session %s already prepared OGX", id)
+	}
+	session.OGXConfigNamespace, session.OGXConfigName = project, "llama-stack-config"
+	session.OGXConfigOriginal, session.OGXConfigPatched = original, patched
+	if err := t.Save(session); err != nil {
+		return err
+	}
+	if original == patched {
+		return nil
+	}
+	if err := t.patchConfigMapYAML(ctx, session.Context, project, "llama-stack-config", patched); err != nil {
+		return err
+	}
+	_, err = t.oc(ctx, session.Context, project, "delete", "pod", "-l", "ogx.io/server=lsd-genai-playground")
+	return err
+}
+
+func (t *Tool) patchConfigMapYAML(ctx context.Context, contextName, namespace, name, yaml string) error {
+	patch, err := json.Marshal([]map[string]any{{"op": "replace", "path": "/data/config.yaml", "value": yaml}})
+	if err != nil {
+		return err
+	}
+	_, err = t.oc(ctx, contextName, namespace, "patch", "configmap", name, "--type=json", "-p", string(patch))
+	return err
+}
+
+func configMapYAML(data []byte) (string, error) {
+	var value struct {
+		Data map[string]string `json:"data"`
+	}
+	if err := json.Unmarshal(data, &value); err != nil {
+		return "", err
+	}
+	yaml, ok := value.Data["config.yaml"]
+	if !ok {
+		return "", fmt.Errorf("ConfigMap has no data.config.yaml")
+	}
+	return yaml, nil
+}
+
+// ActivateLive switches the authenticated production gateway only after the
+// isolated stack is ready. It is separately callable so interrupted terminals
+// cannot leave a half-applied traffic change.
+func (t *Tool) ActivateLive(ctx context.Context, id string) error {
+	session, err := t.Load(id)
+	if err != nil {
+		return err
+	}
+	if session.Mode != "live" {
+		return fmt.Errorf("session %s is not a live session", id)
+	}
+	suffix := strings.ReplaceAll(strings.TrimPrefix(session.ID, session.Component.Name+"-"), "t", "")
+	dashboardName := "rhods-dashboard-pr-" + suffix
+	if err := t.rollout(ctx, session, dashboardName); err != nil {
+		return err
+	}
+	operator, err := t.oc(ctx, session.Context, session.Namespace, "get", "deployment", "dashboard-operator", "-o", "json")
+	if err != nil {
+		return err
+	}
+	replicas, err := deploymentReplicas(operator)
+	if err != nil {
+		return err
+	}
+	liveRoute, err := t.oc(ctx, session.Context, session.Namespace, "get", "httproute", "rhods-dashboard", "-o", "json")
+	if err != nil {
+		return err
+	}
+	target, err := routeTarget(liveRoute)
+	if err != nil {
+		return err
+	}
+	if session.RouteTarget != "" {
+		return fmt.Errorf("session %s is already activated", id)
+	}
+	session.OperatorReplicas, session.RouteTarget = &replicas, target
+	if err := t.Save(session); err != nil {
+		return err
+	}
+	if _, err := t.oc(ctx, session.Context, session.Namespace, "scale", "deployment", "dashboard-operator", "--replicas=0"); err != nil {
+		return err
+	}
+	patch, err := core.LiveRoutePatch(dashboardName)
+	if err != nil {
+		return err
+	}
+	if _, err = t.oc(ctx, session.Context, session.Namespace, "patch", "httproute", "rhods-dashboard", "--type=json", "-p", string(patch)); err != nil {
+		return err
+	}
+	session.URL = "https://rh-ai.apps.rosa.akundu-cluster.vbry.p3.openshiftapps.com/gen-ai-studio/playground"
 	return t.Save(session)
 }
 
@@ -340,6 +548,228 @@ func (t *Tool) resolveImage(ctx context.Context, options DeployOptions, componen
 		return "quay.io/opendatahub/odh-mod-arch-gen-ai:odh-pr-" + sha, nil
 	}
 	return "", fmt.Errorf("PR image resolution is not configured for %s; use --image", component.Name)
+}
+
+func (t *Tool) deployStack(ctx context.Context, options DeployOptions, component core.Component, image string, componentDeployment []byte, session Session, live bool) (Session, error) {
+	hostImage := options.HostImage
+	if hostImage == "" && options.PR > 0 {
+		output, err := t.runner.Run(ctx, "gh", "pr", "view", fmt.Sprint(options.PR), "--repo", "opendatahub-io/odh-dashboard", "--json", "headRefOid", "--jq", ".headRefOid")
+		if err != nil {
+			return Session{}, err
+		}
+		hostImage = "quay.io/opendatahub/odh-dashboard:odh-pr-" + strings.TrimSpace(string(output))
+	}
+	if hostImage == "" {
+		return Session{}, fmt.Errorf("stack deployment requires --host-image or --pr")
+	}
+	hostImage, err := t.verifyAndPinImage(ctx, options.Context, hostImage)
+	if err != nil {
+		return Session{}, err
+	}
+	componentService, err := t.oc(ctx, options.Context, options.Namespace, "get", "service", component.Service, "-o", "json")
+	if err != nil {
+		return Session{}, err
+	}
+	hostDeployment, err := t.oc(ctx, options.Context, options.Namespace, "get", "deployment", "rhods-dashboard", "-o", "json")
+	if err != nil {
+		return Session{}, err
+	}
+	hostService, err := t.oc(ctx, options.Context, options.Namespace, "get", "service", "rhods-dashboard", "-o", "json")
+	if err != nil {
+		return Session{}, err
+	}
+	federation, err := t.oc(ctx, options.Context, options.Namespace, "get", "configmap", "federation-config", "-o", "json")
+	if err != nil {
+		return Session{}, err
+	}
+	route, err := t.oc(ctx, options.Context, options.Namespace, "get", "route", "rhods-dashboard", "-o", "json")
+	if err != nil {
+		return Session{}, err
+	}
+	hostname, err := stackHostname(route, session.ID)
+	if err != nil {
+		return Session{}, err
+	}
+	suffix := strings.ReplaceAll(strings.TrimPrefix(session.ID, component.Name+"-"), "t", "")
+	componentName := component.Deployment + "-pr-" + suffix
+	componentServiceName := component.Service + "-pr-" + suffix
+	dashboardName := "rhods-dashboard-pr-" + suffix
+	federationName := "federation-config-pr-" + suffix
+	routeName := "odh-pr-" + suffix
+	componentManifest, err := core.ShadowManifest(componentDeployment, componentName, component.Container, image, session.ID)
+	if err != nil {
+		return Session{}, err
+	}
+	componentManifest, err = core.AddWorkloadLabel(componentManifest, "component")
+	if err != nil {
+		return Session{}, err
+	}
+	componentServiceManifest, err := core.StackServiceManifest(componentService, componentServiceName, session.ID, "component")
+	if err != nil {
+		return Session{}, err
+	}
+	hostManifest, err := core.ShadowManifest(hostDeployment, dashboardName, "rhods-dashboard", hostImage, session.ID)
+	if err != nil {
+		return Session{}, err
+	}
+	if !live {
+		hostManifest, err = core.SetContainerEnv(hostManifest, "rhods-dashboard", "GATEWAY_DOMAIN", hostname)
+		if err != nil {
+			return Session{}, err
+		}
+	}
+	var hostObject map[string]any
+	if err := json.Unmarshal(hostManifest, &hostObject); err != nil {
+		return Session{}, err
+	}
+	containers := hostObject["spec"].(map[string]any)["template"].(map[string]any)["spec"].(map[string]any)["containers"].([]any)
+	for _, item := range containers {
+		c := item.(map[string]any)
+		if c["name"] == "rhods-dashboard" {
+			for _, envItem := range c["env"].([]any) {
+				env := envItem.(map[string]any)
+				if env["name"] == "MODULE_FEDERATION_CONFIG" {
+					env["valueFrom"].(map[string]any)["configMapKeyRef"].(map[string]any)["name"] = federationName
+				}
+			}
+		}
+	}
+	hostManifest, err = json.Marshal(hostObject)
+	if err != nil {
+		return Session{}, err
+	}
+	hostManifest, err = core.AddWorkloadLabel(hostManifest, "dashboard")
+	if err != nil {
+		return Session{}, err
+	}
+	hostServiceManifest, err := core.StackServiceManifest(hostService, dashboardName, session.ID, "dashboard")
+	if err != nil {
+		return Session{}, err
+	}
+	federationManifest, err := core.StackFederationManifest(federation, federationName, session.ID, componentServiceName, dashboardName)
+	if err != nil {
+		return Session{}, err
+	}
+	routeManifest, err := core.StackRouteManifest(routeName, options.Namespace, session.ID, hostname, dashboardName)
+	if err != nil {
+		return Session{}, err
+	}
+	ingressRouteManifest, err := core.StackIngressRouteManifest(routeName, session.ID, hostname)
+	if err != nil {
+		return Session{}, err
+	}
+	resources := []struct {
+		name      string
+		data      []byte
+		namespace string
+	}{{componentName, componentManifest, options.Namespace}, {componentServiceName, componentServiceManifest, options.Namespace}, {federationName, federationManifest, options.Namespace}, {dashboardName, hostManifest, options.Namespace}, {dashboardName + "-service", hostServiceManifest, options.Namespace}, {routeName, routeManifest, options.Namespace}, {routeName + "-ingress", ingressRouteManifest, "openshift-ingress"}}
+	session.HostImage, session.URL = hostImage, "https://"+hostname+"/gen-ai-studio/playground"
+	session.Resources = []string{"deployment/" + componentName, "service/" + componentServiceName, "configmap/" + federationName, "deployment/" + dashboardName, "service/" + dashboardName, "httproute/" + routeName, "openshift-ingress|route/" + routeName}
+	if err := t.Save(session); err != nil {
+		return Session{}, err
+	}
+	for _, resource := range resources {
+		path := filepath.Join(t.stateDir, session.ID+"-"+resource.name+".json")
+		if err := os.WriteFile(path, resource.data, 0600); err != nil {
+			return Session{}, err
+		}
+		if _, err := t.oc(ctx, options.Context, resource.namespace, "apply", "-f", path); err != nil {
+			return Session{}, err
+		}
+	}
+	if err := t.rollout(ctx, session, componentName); err != nil {
+		return Session{}, err
+	}
+	if err := t.rollout(ctx, session, dashboardName); err != nil {
+		return Session{}, err
+	}
+	if live {
+		operator, err := t.oc(ctx, options.Context, options.Namespace, "get", "deployment", "dashboard-operator", "-o", "json")
+		if err != nil {
+			return Session{}, err
+		}
+		replicas, err := deploymentReplicas(operator)
+		if err != nil {
+			return Session{}, err
+		}
+		liveRoute, err := t.oc(ctx, options.Context, options.Namespace, "get", "httproute", "rhods-dashboard", "-o", "json")
+		if err != nil {
+			return Session{}, err
+		}
+		target, err := routeTarget(liveRoute)
+		if err != nil {
+			return Session{}, err
+		}
+		session.OperatorReplicas, session.RouteTarget = &replicas, target
+		if err := t.Save(session); err != nil {
+			return Session{}, err
+		}
+		if _, err := t.oc(ctx, options.Context, options.Namespace, "scale", "deployment", "dashboard-operator", "--replicas=0"); err != nil {
+			return Session{}, err
+		}
+		patch, err := core.LiveRoutePatch(dashboardName)
+		if err != nil {
+			return Session{}, err
+		}
+		if _, err = t.oc(ctx, options.Context, options.Namespace, "patch", "httproute", "rhods-dashboard", "--type=json", "-p", string(patch)); err != nil {
+			return Session{}, err
+		}
+		session.URL = "https://rh-ai.apps.rosa.akundu-cluster.vbry.p3.openshiftapps.com/gen-ai-studio/playground"
+		if err := t.Save(session); err != nil {
+			return Session{}, err
+		}
+	}
+	return session, nil
+}
+
+func deploymentReplicas(data []byte) (int32, error) {
+	var value struct {
+		Spec struct {
+			Replicas *int32 `json:"replicas"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(data, &value); err != nil {
+		return 0, err
+	}
+	if value.Spec.Replicas == nil {
+		return 1, nil
+	}
+	return *value.Spec.Replicas, nil
+}
+
+func routeTarget(data []byte) (string, error) {
+	var value struct {
+		Spec struct {
+			Rules []struct {
+				BackendRefs []struct {
+					Name string `json:"name"`
+				} `json:"backendRefs"`
+			} `json:"rules"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(data, &value); err != nil {
+		return "", err
+	}
+	if len(value.Spec.Rules) == 0 || len(value.Spec.Rules[0].BackendRefs) == 0 || value.Spec.Rules[0].BackendRefs[0].Name == "" {
+		return "", fmt.Errorf("gateway route has no first backend")
+	}
+	return value.Spec.Rules[0].BackendRefs[0].Name, nil
+}
+
+func stackHostname(route []byte, session string) (string, error) {
+	var value struct {
+		Spec struct {
+			Host string `json:"host"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(route, &value); err != nil {
+		return "", err
+	}
+	parts := strings.SplitN(value.Spec.Host, ".apps.", 2)
+	if len(parts) != 2 {
+		return "", fmt.Errorf("could not derive apps domain from route host %q", value.Spec.Host)
+	}
+	return "odh-pr-" + strings.ReplaceAll(session, "_", "-") + ".apps." + parts[1], nil
 }
 
 func (t *Tool) verifyAndPinImage(ctx context.Context, contextName, image string) (string, error) {

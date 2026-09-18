@@ -1,2 +1,8 @@
-bin/
+/bin/
+# Local build artifacts
+/odh-pr-deploy
+
+# Local test/development configuration
+.env
+.env.*
 .DS_Store

@@ -1,6 +1,6 @@
 # odh-pr-deploy
 
-`odh-pr-deploy` safely tests a Dashboard component PR image on an existing RHOAI cluster. It does not install, upgrade, or modify RHOAI CatalogSources, Subscriptions, CRDs, or OGX.
+`odh-pr-deploy` safely tests a Dashboard component PR image on an existing RHOAI cluster. It does not install or upgrade RHOAI, CatalogSources, Subscriptions, or CRDs.
 
 ## Commands
 
@@ -15,6 +15,13 @@ odh-pr-deploy deploy --context CONTEXT --component gen-ai --pr PR_NUMBER
 odh-pr-deploy deploy --context CONTEXT --component gen-ai --pr PR_NUMBER \
   --mode managed --allow-managed-update
 
+# Switch the normal Dashboard route to an isolated PR stack after it is ready.
+odh-pr-deploy deploy --context CONTEXT --component gen-ai --pr PR_NUMBER \
+  --mode live --allow-live-traffic
+
+# For an existing Playground project, add the reversible OGX Responses API proxy.
+odh-pr-deploy prepare-ogx --session SESSION_ID --project PROJECT_NAMESPACE
+
 # Inspect and restore a session.
 odh-pr-deploy status --session SESSION_ID
 odh-pr-deploy cleanup --session SESSION_ID
@@ -25,6 +32,6 @@ odh-pr-deploy recover
 
 ## Restoration guarantee
 
-Before a deployment mutation, the tool saves a local session under `$ODH_PR_DEPLOY_STATE_DIR` or `$HOME/.local/state/odh-pr-deploy`. Managed mode records the exact original component image. `cleanup` refuses to overwrite an image changed by another actor, restores that original image only when safe, and waits for the managed deployment to return to it. Controller-owned workloads are refused before mutation.
+Before a deployment mutation, the tool saves a local session under `$ODH_PR_DEPLOY_STATE_DIR` or `$HOME/.local/state/odh-pr-deploy`. Live mode records the original route, Dashboard operator replica count, and any OGX ConfigMap value changed by `prepare-ogx`. `cleanup` refuses to overwrite values changed by another actor, restores the recorded values, and deletes only session-created resources. Controller-owned workloads are refused before mutation.
 
 Shadow cleanup deletes only the tool-created Deployment and first confirms that the source managed deployment still has its original image.

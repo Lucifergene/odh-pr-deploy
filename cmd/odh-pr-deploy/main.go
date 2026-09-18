@@ -37,13 +37,15 @@ func run(args []string) error {
 		contextName, namespace, component := commonFlags(fs, &stateDir)
 		image := fs.String("image", "", "immutable image reference")
 		pr := fs.Int("pr", 0, "GitHub PR number")
-		mode := fs.String("mode", "shadow", "shadow or managed")
+		mode := fs.String("mode", "stack", "stack, shadow, managed, or live")
+		hostImage := fs.String("host-image", "", "Dashboard host image; defaults to the matching PR image")
 		allowManaged := fs.Bool("allow-managed-update", false, "acknowledge mutation of the managed Dashboard component")
+		allowLive := fs.Bool("allow-live-traffic", false, "required to switch rh-ai to the isolated test stack")
 		if err := fs.Parse(args[1:]); err != nil {
 			return err
 		}
 		tool := app.New(app.OSRunner{}, stateDir)
-		session, err := tool.Deploy(context.Background(), app.DeployOptions{Context: *contextName, Namespace: *namespace, Component: *component, Image: *image, PR: *pr, Mode: *mode, AllowManaged: *allowManaged})
+		session, err := tool.Deploy(context.Background(), app.DeployOptions{Context: *contextName, Namespace: *namespace, Component: *component, Image: *image, PR: *pr, Mode: *mode, HostImage: *hostImage, AllowManaged: *allowManaged, AllowLive: *allowLive})
 		if err != nil {
 			return err
 		}
@@ -63,6 +65,33 @@ func run(args []string) error {
 			return err
 		}
 		return printJSON(session)
+	case "activate":
+		fs := flag.NewFlagSet(command, flag.ContinueOnError)
+		fs.StringVar(&stateDir, "state-dir", stateDir, "session state directory")
+		id := fs.String("session", "", "session ID")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *id == "" {
+			return fmt.Errorf("--session is required")
+		}
+		if err := app.New(app.OSRunner{}, stateDir).ActivateLive(context.Background(), *id); err != nil {
+			return err
+		}
+		fmt.Printf("session %s is serving the live rh-ai route\n", *id)
+		return nil
+	case "prepare-ogx":
+		fs := flag.NewFlagSet(command, flag.ContinueOnError)
+		fs.StringVar(&stateDir, "state-dir", stateDir, "session state directory")
+		id := fs.String("session", "", "session ID")
+		project := fs.String("project", "", "data-science project namespace")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if *id == "" || *project == "" {
+			return fmt.Errorf("--session and --project are required")
+		}
+		return app.New(app.OSRunner{}, stateDir).PrepareOGXPassthrough(context.Background(), *id, *project)
 	case "cleanup":
 		fs := flag.NewFlagSet(command, flag.ContinueOnError)
 		fs.StringVar(&stateDir, "state-dir", stateDir, "session state directory")
@@ -155,5 +184,5 @@ func printJSON(value any) error {
 }
 
 func usage() error {
-	return fmt.Errorf("usage: odh-pr-deploy <inspect|deploy|status|cleanup|recover> [flags]")
+	return fmt.Errorf("usage: odh-pr-deploy <inspect|deploy|activate|prepare-ogx|status|cleanup|recover> [flags]")
 }
