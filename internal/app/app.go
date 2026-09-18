@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/akundu/odh-pr-deploy/internal/core"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/akundu/odh-pr-deploy/internal/core"
 )
 
 type Runner interface {
@@ -17,13 +19,13 @@ type Runner interface {
 }
 type OSRunner struct{}
 
-func (OSRunner) Run(ctx context.Context, n string, a ...string) ([]byte, error) {
-	c := exec.CommandContext(ctx, n, a...)
-	o, e := c.CombinedOutput()
-	if e != nil {
-		return o, fmt.Errorf("%s %s: %w: %s", n, strings.Join(a, " "), e, strings.TrimSpace(string(o)))
+func (OSRunner) Run(ctx context.Context, name string, args ...string) ([]byte, error) {
+	c := exec.CommandContext(ctx, name, args...)
+	out, err := c.CombinedOutput()
+	if err != nil {
+		return out, fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
-	return o, nil
+	return out, nil
 }
 
 type Tool struct {
@@ -31,20 +33,20 @@ type Tool struct {
 	stateDir string
 }
 
-func New(r Runner, d string) *Tool { return &Tool{r, d} }
+func New(r Runner, stateDir string) *Tool { return &Tool{runner: r, stateDir: stateDir} }
 
 type DeployOptions struct {
-	Context, Namespace, Component, Image string
-	PR                                   int
+	Context, Namespace, Component, Image, ManifestsDir string
+	PR                                                 int
 }
 type Session = core.Session
 
-func (t *Tool) oc(ctx context.Context, c, n string, a ...string) ([]byte, error) {
-	x := []string{"--context", c}
+func (t *Tool) oc(ctx context.Context, k, n string, a ...string) ([]byte, error) {
+	args := []string{"--context", k}
 	if n != "" {
-		x = append(x, "-n", n)
+		args = append(args, "-n", n)
 	}
-	return t.runner.Run(ctx, "oc", append(x, a...)...)
+	return t.runner.Run(ctx, "oc", append(args, a...)...)
 }
 func (t *Tool) path(id string) (string, error) {
 	if !core.ValidSessionID(id) {
@@ -70,11 +72,11 @@ func (t *Tool) Save(s Session) error {
 	}
 	defer os.Remove(f.Name())
 	if _, e = f.Write(b); e != nil {
-		f.Close()
+		_ = f.Close()
 		return e
 	}
 	if e = f.Chmod(0600); e != nil {
-		f.Close()
+		_ = f.Close()
 		return e
 	}
 	if e = f.Close(); e != nil {
@@ -101,20 +103,21 @@ func (t *Tool) Sessions() ([]Session, error) {
 	if e != nil {
 		return nil, e
 	}
-	var r []Session
+	var ss []Session
 	for _, x := range es {
-		if x.IsDir() || !strings.HasSuffix(x.Name(), ".json") {
-			continue
+		if !x.IsDir() && strings.HasSuffix(x.Name(), ".json") {
+			s, e := t.Load(strings.TrimSuffix(x.Name(), ".json"))
+			if e != nil {
+				return nil, e
+			}
+			ss = append(ss, s)
 		}
-		s, e := t.Load(strings.TrimSuffix(x.Name(), ".json"))
-		if e != nil {
-			return nil, e
-		}
-		r = append(r, s)
 	}
-	return r, nil
+	return ss, nil
 }
 
+// Deploy changes the RHOAI operator CSV's related-image input. Direct edits to
+// the controller-owned Dashboard operator are reconciled away.
 func (t *Tool) Deploy(ctx context.Context, o DeployOptions) (Session, error) {
 	if o.Context == "" || o.Component == "" {
 		return Session{}, fmt.Errorf("--context and --component are required")
@@ -130,31 +133,35 @@ func (t *Tool) Deploy(ctx context.Context, o DeployOptions) (Session, error) {
 			return Session{}, e
 		}
 	}
-	opNS, opName, e := t.operator(ctx, o.Context, ns)
+	image, e := t.image(ctx, o, c)
 	if e != nil {
 		return Session{}, e
 	}
-	img, e := t.image(ctx, o, c)
+	image, e = t.pin(ctx, o.Context, image)
 	if e != nil {
 		return Session{}, e
 	}
-	img, e = t.pin(ctx, o.Context, img)
+	b, e := t.oc(ctx, o.Context, ns, "get", "deployment", c.Deployment, "-o", "json")
 	if e != nil {
 		return Session{}, e
 	}
-	operator, e := t.oc(ctx, o.Context, opNS, "get", "deployment", opName, "-o", "json")
+	original, e := deploymentImage(b, c.Container)
 	if e != nil {
 		return Session{}, e
 	}
-	uid, rv, old, e := operatorState(operator, c.ImageEnv)
+	csvName, e := t.rhoaiCSV(ctx, o.Context)
 	if e != nil {
 		return Session{}, e
 	}
-	dep, e := t.oc(ctx, o.Context, ns, "get", "deployment", c.Deployment, "-o", "json")
+	b, e = t.oc(ctx, o.Context, "redhat-ods-operator", "get", "csv", csvName, "-o", "json")
 	if e != nil {
 		return Session{}, e
 	}
-	original, e := deploymentImage(dep, c.Container)
+	_, rv, e := csvDeployment(b)
+	if e != nil {
+		return Session{}, e
+	}
+	index, previous, e := csvImageVariable(b, c.ImageEnv)
 	if e != nil {
 		return Session{}, e
 	}
@@ -162,27 +169,50 @@ func (t *Tool) Deploy(ctx context.Context, o DeployOptions) (Session, error) {
 	if e != nil {
 		return Session{}, e
 	}
-	s := Session{ID: id, Context: o.Context, Namespace: ns, Component: c, Image: img, OriginalImage: original, OperatorNamespace: opNS, OperatorDeployment: opName, OperatorContainer: "manager", OperatorUID: uid, OperatorResourceVersion: rv, OriginalVariable: old}
-	if s.DashboardURL, e = t.dashboardURL(ctx, o.Context, ns); e != nil {
-		return Session{}, e
-	}
+	annotation := "odh-pr-deploy.openshift.io/reconcile-" + id
+	s := Session{ID: id, Context: o.Context, Namespace: ns, Component: c, Image: image, OriginalImage: original, CSVNamespace: "redhat-ods-operator", CSVName: csvName, CSVResourceVersion: rv, CSVEnvIndex: index, OriginalVariable: core.ImageVariable{Present: true, Value: previous}, DSCAnnotation: annotation}
 	if e = t.Save(s); e != nil {
 		return Session{}, e
 	}
-	p, e := core.UpdatePatch(s.OperatorContainer, c.ImageEnv, img, rv)
-	if e != nil {
+	if e = t.patchCSVImage(ctx, s, previous, image, rv); e != nil {
 		return Session{}, e
 	}
-	if _, e = t.oc(ctx, o.Context, opNS, "patch", "deployment", opName, "--type=strategic", "-p", string(p)); e != nil {
+	if e = t.waitOperator(ctx, s); e != nil {
 		return Session{}, e
 	}
-	if e = t.rollout(ctx, s, opNS, opName); e != nil {
+	if e = t.triggerDashboardReconcile(ctx, s); e != nil {
 		return Session{}, e
 	}
-	if e = t.waitImage(ctx, s, c.Deployment, img); e != nil {
+	if e = t.waitImage(ctx, s, image); e != nil {
 		return Session{}, e
 	}
 	return s, nil
+}
+
+func (t *Tool) createPVC(ctx context.Context, s Session) error {
+	manifest, err := json.Marshal(map[string]any{
+		"apiVersion": "v1", "kind": "PersistentVolumeClaim",
+		"metadata": map[string]any{"name": s.PVCName, "namespace": s.CSVNamespace, "labels": map[string]string{"app.kubernetes.io/managed-by": "odh-pr-deploy", "odh-pr-deploy/session": s.ID}},
+		"spec":     map[string]any{"accessModes": []string{"ReadWriteOnce"}, "resources": map[string]any{"requests": map[string]string{"storage": "1Gi"}}},
+	})
+	if err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(t.stateDir, ".pvc-*.json")
+	if err != nil {
+		return err
+	}
+	path := f.Name()
+	defer os.Remove(path)
+	if _, err = f.Write(manifest); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	_, err = t.oc(ctx, s.Context, s.CSVNamespace, "apply", "-f", path)
+	return err
 }
 func (t *Tool) Cleanup(ctx context.Context, id string) error {
 	s, e := t.Load(id)
@@ -192,48 +222,150 @@ func (t *Tool) Cleanup(ctx context.Context, id string) error {
 	if s.Completed {
 		return nil
 	}
-	b, e := t.oc(ctx, s.Context, s.OperatorNamespace, "get", "deployment", s.OperatorDeployment, "-o", "json")
-	if e != nil {
-		return e
-	}
-	uid, rv, cur, e := operatorState(b, s.Component.ImageEnv)
-	if e != nil {
-		return e
-	}
-	if uid != s.OperatorUID {
-		return fmt.Errorf("refusing cleanup: operator was replaced")
-	}
-	if cur.Present == s.OriginalVariable.Present && cur.Value == s.OriginalVariable.Value {
+	if s.CSVName == "" {
 		s.Completed = true
 		return t.Save(s)
 	}
-	if cur.Present != true || cur.Value != s.Image {
-		return fmt.Errorf("refusing cleanup: override changed outside session")
-	}
-	p, e := core.RestorePatch(s.OperatorContainer, s.Component.ImageEnv, s.OriginalVariable, rv)
+	b, e := t.oc(ctx, s.Context, s.CSVNamespace, "get", "csv", s.CSVName, "-o", "json")
 	if e != nil {
 		return e
 	}
-	if _, e = t.oc(ctx, s.Context, s.OperatorNamespace, "patch", "deployment", s.OperatorDeployment, "--type=strategic", "-p", string(p)); e != nil {
+	_, rv, e := csvDeployment(b)
+	if e != nil {
 		return e
 	}
-	if e = t.rollout(ctx, s, s.OperatorNamespace, s.OperatorDeployment); e != nil {
+	_, current, e := csvImageVariable(b, s.Component.ImageEnv)
+	if e != nil {
 		return e
 	}
-	if e = t.waitImage(ctx, s, s.Component.Deployment, s.OriginalImage); e != nil {
+	if current == s.OriginalVariable.Value {
+		s.Completed = true
+		return t.Save(s)
+	}
+	if current != s.Image {
+		return fmt.Errorf("refusing cleanup: CSV image was changed outside this session")
+	}
+	if e = t.patchCSVImage(ctx, s, current, s.OriginalVariable.Value, rv); e != nil {
+		return e
+	}
+	if e = t.waitOperator(ctx, s); e != nil {
+		return e
+	}
+	if e = t.triggerDashboardReconcile(ctx, s); e != nil {
+		return e
+	}
+	if e = t.waitImage(ctx, s, s.OriginalImage); e != nil {
+		return e
+	}
+	if _, e = t.oc(ctx, s.Context, "", "annotate", "datasciencecluster", "default-dsc", s.DSCAnnotation+"-"); e != nil {
 		return e
 	}
 	s.Completed = true
 	return t.Save(s)
 }
-func (t *Tool) rollout(ctx context.Context, s Session, n, d string) error {
-	_, e := t.oc(ctx, s.Context, n, "rollout", "status", "deployment/"+d, "--timeout=10m")
+
+func (t *Tool) restoreLiveOperator(ctx context.Context, s Session) error {
+	b, err := t.oc(ctx, s.Context, s.CSVNamespace, "get", "deployment", "rhods-operator", "-o", "json")
+	if err != nil {
+		return err
+	}
+	if !operatorHasSessionMount(b, s.PVCName) {
+		return fmt.Errorf("refusing cleanup: live operator no longer has this session PVC mount")
+	}
+	var current struct {
+		Metadata struct {
+			ResourceVersion string `json:"resourceVersion"`
+		} `json:"metadata"`
+	}
+	if err = json.Unmarshal(b, &current); err != nil {
+		return err
+	}
+	var original struct {
+		Spec map[string]json.RawMessage `json:"spec"`
+	}
+	if err = json.Unmarshal(s.OperatorOriginalSpec, &original); err != nil {
+		return fmt.Errorf("decode saved operator spec: %w", err)
+	}
+	template := original.Spec["template"]
+	var templateValue map[string]any
+	if err = json.Unmarshal(template, &templateValue); err != nil {
+		return err
+	}
+	podSpec := templateValue["spec"].(map[string]any)
+	patch, err := json.Marshal([]any{
+		map[string]any{"op": "test", "path": "/metadata/resourceVersion", "value": current.Metadata.ResourceVersion},
+		map[string]any{"op": "replace", "path": "/spec/replicas", "value": original.Spec["replicas"]},
+		map[string]any{"op": "replace", "path": "/spec/strategy", "value": original.Spec["strategy"]},
+		map[string]any{"op": "replace", "path": "/spec/template/spec/securityContext", "value": podSpec["securityContext"]},
+		map[string]any{"op": "replace", "path": "/spec/template/spec/volumes", "value": podSpec["volumes"]},
+		map[string]any{"op": "replace", "path": "/spec/template/spec/containers/0/volumeMounts", "value": podSpec["containers"].([]any)[0].(map[string]any)["volumeMounts"]},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = t.oc(ctx, s.Context, s.CSVNamespace, "patch", "deployment", "rhods-operator", "--type=json", "-p", string(patch))
+	return err
+}
+func (t *Tool) replaceCSVDeployment(ctx context.Context, s Session, wanted json.RawMessage, rv string) error {
+	p, e := json.Marshal([]any{map[string]any{"op": "test", "path": "/metadata/resourceVersion", "value": rv}, map[string]any{"op": "replace", "path": "/spec/install/spec/deployments/0", "value": json.RawMessage(wanted)}})
+	if e != nil {
+		return e
+	}
+	_, e = t.oc(ctx, s.Context, s.CSVNamespace, "patch", "csv", s.CSVName, "--type=json", "-p", string(p))
 	return e
 }
-func (t *Tool) waitImage(ctx context.Context, s Session, d, want string) error {
-	end := time.Now().Add(10 * time.Minute)
-	for time.Now().Before(end) {
-		b, e := t.oc(ctx, s.Context, s.Namespace, "get", "deployment", d, "-o", "json")
+
+func (t *Tool) patchCSVImage(ctx context.Context, s Session, expected, image, rv string) error {
+	path := fmt.Sprintf("/spec/install/spec/deployments/0/spec/template/spec/containers/0/env/%d/value", s.CSVEnvIndex)
+	patch, err := json.Marshal([]any{
+		map[string]any{"op": "test", "path": "/metadata/resourceVersion", "value": rv},
+		map[string]any{"op": "test", "path": path, "value": expected},
+		map[string]any{"op": "replace", "path": path, "value": image},
+	})
+	if err != nil {
+		return err
+	}
+	_, err = t.oc(ctx, s.Context, s.CSVNamespace, "patch", "csv", s.CSVName, "--type=json", "-p", string(patch))
+	return err
+}
+
+func (t *Tool) triggerDashboardReconcile(ctx context.Context, s Session) error {
+	_, err := t.oc(ctx, s.Context, "", "annotate", "datasciencecluster", "default-dsc", s.DSCAnnotation+"="+s.ID, "--overwrite")
+	return err
+}
+func (t *Tool) waitOperator(ctx context.Context, s Session) error {
+	_, e := t.oc(ctx, s.Context, s.CSVNamespace, "rollout", "status", "deployment/rhods-operator", "--timeout=10m")
+	return e
+}
+func (t *Tool) restartOperator(ctx context.Context, s Session) error {
+	if _, e := t.oc(ctx, s.Context, s.CSVNamespace, "rollout", "restart", "deployment/rhods-operator"); e != nil {
+		return e
+	}
+	return t.waitOperator(ctx, s)
+}
+func (t *Tool) copyManifests(ctx context.Context, s Session) error {
+	p, e := t.oc(ctx, s.Context, s.CSVNamespace, "get", "pod", "-l", "name=rhods-operator", "-o", "jsonpath={.items[0].metadata.name}")
+	if e != nil {
+		return e
+	}
+	pod := strings.TrimSpace(string(p))
+	if _, e = t.oc(ctx, s.Context, s.CSVNamespace, "exec", pod, "--", "sh", "-c", "mkdir -p /opt/manifests/dashboard"); e != nil {
+		return e
+	}
+	_, e = t.oc(ctx, s.Context, "", "cp", filepath.Join(s.ManifestsDir, "manifests")+"/.", s.CSVNamespace+"/"+pod+":/opt/manifests/dashboard")
+	if e != nil {
+		return e
+	}
+	// The copied params file deliberately contains a development default. Pin
+	// this session's resolved PR digest after copy so the nested Dashboard
+	// operator renders the exact image that was preflighted.
+	_, e = t.oc(ctx, s.Context, s.CSVNamespace, "exec", pod, "--", "sed", "-i", "s|^gen-ai-ui-image=.*|gen-ai-ui-image="+s.Image+"|", "/opt/manifests/dashboard/modules/gen-ai/params.env")
+	return e
+}
+func (t *Tool) waitImage(ctx context.Context, s Session, want string) error {
+	until := time.Now().Add(12 * time.Minute)
+	for time.Now().Before(until) {
+		b, e := t.oc(ctx, s.Context, s.Namespace, "get", "deployment", s.Component.Deployment, "-o", "json")
 		if e != nil {
 			return e
 		}
@@ -242,130 +374,90 @@ func (t *Tool) waitImage(ctx context.Context, s Session, d, want string) error {
 			return e
 		}
 		if got == want {
-			return t.rollout(ctx, s, s.Namespace, d)
+			_, e = t.oc(ctx, s.Context, s.Namespace, "rollout", "status", "deployment/"+s.Component.Deployment, "--timeout=10m")
+			return e
 		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
-	return fmt.Errorf("timed out waiting for deployment/%s image %q", d, want)
+	return fmt.Errorf("timed out waiting for %s image %s", s.Component.Deployment, want)
+}
+func (t *Tool) dashboardNamespace(ctx context.Context, k string) (string, error) {
+	b, e := t.oc(ctx, k, "", "get", "deployment", "-A", "-l", "app.kubernetes.io/name=gen-ai", "-o", "json")
+	if e != nil {
+		return "", e
+	}
+	var v struct {
+		Items []struct {
+			Metadata struct {
+				Namespace string `json:"namespace"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	if e = json.Unmarshal(b, &v); e != nil || len(v.Items) != 1 {
+		return "", fmt.Errorf("could not uniquely discover dashboard namespace")
+	}
+	return v.Items[0].Metadata.Namespace, nil
+}
+func (t *Tool) rhoaiCSV(ctx context.Context, k string) (string, error) {
+	b, e := t.oc(ctx, k, "redhat-ods-operator", "get", "subscription", "rhods-operator", "-o", "jsonpath={.status.installedCSV}")
+	if e != nil {
+		return "", e
+	}
+	if n := strings.TrimSpace(string(b)); n != "" {
+		return n, nil
+	}
+	return "", fmt.Errorf("RHOAI operator subscription has no installed CSV")
+}
+
+func (t *Tool) allowedFSGroup(ctx context.Context, k, namespace string) (int64, error) {
+	b, err := t.oc(ctx, k, "", "get", "namespace", namespace, "-o", "json")
+	if err != nil {
+		return 0, err
+	}
+	var ns struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if err = json.Unmarshal(b, &ns); err != nil {
+		return 0, err
+	}
+	rangeValue := ns.Metadata.Annotations["openshift.io/sa.scc.supplemental-groups"]
+	first := strings.Split(rangeValue, "/")[0]
+	value, err := strconv.ParseInt(first, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, fmt.Errorf("cannot derive an allowed fsGroup from namespace %q", namespace)
+	}
+	return value, nil
 }
 func (t *Tool) image(ctx context.Context, o DeployOptions, c core.Component) (string, error) {
 	if o.Image != "" {
 		return o.Image, nil
 	}
 	if o.PR <= 0 {
-		return "", fmt.Errorf("provide --image or --pr")
+		return "", fmt.Errorf("--image or --pr is required")
 	}
-	b, e := t.runner.Run(ctx, "gh", "pr", "view", fmt.Sprint(o.PR), "--repo", "opendatahub-io/odh-dashboard", "--json", "headRefOid", "--jq", ".headRefOid")
+	b, e := t.runner.Run(ctx, "gh", "api", fmt.Sprintf("repos/opendatahub-io/odh-dashboard/pulls/%d", o.PR), "--jq", ".head.sha")
 	if e != nil {
 		return "", e
 	}
-	repo := "odh-mod-arch-gen-ai"
-	if c.Name == "dashboard" {
-		repo = "odh-dashboard"
-	}
-	return "quay.io/opendatahub/" + repo + ":odh-pr-" + strings.TrimSpace(string(b)), nil
+	return "quay.io/opendatahub/odh-mod-arch-gen-ai:odh-pr-" + strings.TrimSpace(string(b)), nil
 }
-func (t *Tool) pin(ctx context.Context, c, img string) (string, error) {
-	b, e := t.oc(ctx, c, "", "image", "info", "--filter-by-os=linux/amd64", img, "-o", "json")
+func (t *Tool) pin(ctx context.Context, k, image string) (string, error) {
+	b, e := t.oc(ctx, k, "", "image", "info", image, "-o", "json")
 	if e != nil {
 		return "", e
 	}
-	var x struct {
+	var info struct {
 		Digest string `json:"digest"`
 	}
-	if e = json.Unmarshal(b, &x); e != nil {
-		return "", e
+	if e = json.Unmarshal(b, &info); e != nil {
+		return "", fmt.Errorf("decode image metadata: %w", e)
 	}
-	return core.PinImage(img, x.Digest)
+	return core.PinImage(image, info.Digest)
 }
-func (t *Tool) dashboardNamespace(ctx context.Context, c string) (string, error) {
-	b, e := t.oc(ctx, c, "", "get", "deployment", "-A", "-o", "json")
-	if e != nil {
-		return "", e
-	}
-	var x struct {
-		Items []struct {
-			Metadata struct {
-				Name      string `json:"name"`
-				Namespace string `json:"namespace"`
-			} `json:"metadata"`
-		} `json:"items"`
-	}
-	if e = json.Unmarshal(b, &x); e != nil {
-		return "", fmt.Errorf("discover Dashboard operator: %w", e)
-	}
-	var namespace string
-	for _, item := range x.Items {
-		if item.Metadata.Name != "dashboard-operator" {
-			continue
-		}
-		if namespace != "" || item.Metadata.Namespace == "" {
-			return "", fmt.Errorf("cannot uniquely discover Dashboard operator namespace")
-		}
-		namespace = item.Metadata.Namespace
-	}
-	if namespace == "" {
-		return "", fmt.Errorf("cannot discover Dashboard operator namespace; provide --namespace")
-	}
-	return namespace, nil
-}
-func (t *Tool) operator(ctx context.Context, c, ns string) (string, string, error) {
-	for _, v := range [][2]string{{ns, "dashboard-operator"}} {
-		if _, e := t.oc(ctx, c, v[0], "get", "deployment", v[1], "-o", "name"); e == nil {
-			return v[0], v[1], nil
-		}
-	}
-	return "", "", fmt.Errorf("could not discover Dashboard operator")
-}
-func (t *Tool) dashboardURL(ctx context.Context, c, ns string) (string, error) {
-	b, e := t.oc(ctx, c, ns, "get", "route", "rhods-dashboard", "-o", "json")
-	if e != nil {
-		return "", e
-	}
-	var x struct {
-		Spec struct {
-			Host string `json:"host"`
-		} `json:"spec"`
-	}
-	if e = json.Unmarshal(b, &x); e != nil || x.Spec.Host == "" {
-		return "", fmt.Errorf("cannot discover Dashboard route")
-	}
-	return "https://" + x.Spec.Host, nil
-}
-func operatorState(b []byte, name string) (string, string, core.ImageVariable, error) {
-	var x struct {
-		Metadata struct {
-			UID             string `json:"uid"`
-			ResourceVersion string `json:"resourceVersion"`
-		} `json:"metadata"`
-		Spec struct {
-			Template struct {
-				Spec struct {
-					Containers []struct {
-						Name string `json:"name"`
-						Env  []struct {
-							Name  string `json:"name"`
-							Value string `json:"value"`
-						} `json:"env"`
-					} `json:"containers"`
-				} `json:"spec"`
-			} `json:"template"`
-		} `json:"spec"`
-	}
-	if e := json.Unmarshal(b, &x); e != nil {
-		return "", "", core.ImageVariable{}, e
-	}
-	for _, c := range x.Spec.Template.Spec.Containers {
-		for _, v := range c.Env {
-			if v.Name == name {
-				return x.Metadata.UID, x.Metadata.ResourceVersion, core.ImageVariable{Present: true, Value: v.Value}, nil
-			}
-		}
-	}
-	return x.Metadata.UID, x.Metadata.ResourceVersion, core.ImageVariable{}, nil
-}
-func deploymentImage(b []byte, n string) (string, error) {
-	var x struct {
+func deploymentImage(b []byte, container string) (string, error) {
+	var d struct {
 		Spec struct {
 			Template struct {
 				Spec struct {
@@ -377,13 +469,163 @@ func deploymentImage(b []byte, n string) (string, error) {
 			} `json:"template"`
 		} `json:"spec"`
 	}
-	if e := json.Unmarshal(b, &x); e != nil {
+	if e := json.Unmarshal(b, &d); e != nil {
 		return "", e
 	}
-	for _, c := range x.Spec.Template.Spec.Containers {
-		if c.Name == n {
-			return c.Image, nil
+	for _, x := range d.Spec.Template.Spec.Containers {
+		if x.Name == container {
+			return x.Image, nil
 		}
 	}
-	return "", fmt.Errorf("container %q not found", n)
+	return "", fmt.Errorf("container %q not found", container)
+}
+func csvDeployment(b []byte) (json.RawMessage, string, error) {
+	var v struct {
+		Metadata struct {
+			ResourceVersion string `json:"resourceVersion"`
+		} `json:"metadata"`
+		Spec struct {
+			Install struct {
+				Spec struct {
+					Deployments []json.RawMessage `json:"deployments"`
+				} `json:"spec"`
+			} `json:"install"`
+		} `json:"spec"`
+	}
+	if e := json.Unmarshal(b, &v); e != nil {
+		return nil, "", e
+	}
+	if len(v.Spec.Install.Spec.Deployments) != 1 {
+		return nil, "", fmt.Errorf("expected exactly one operator deployment in CSV")
+	}
+	return v.Spec.Install.Spec.Deployments[0], v.Metadata.ResourceVersion, nil
+}
+
+func csvImageVariable(b []byte, name string) (int, string, error) {
+	var v struct {
+		Spec struct {
+			Install struct {
+				Spec struct {
+					Deployments []struct {
+						Spec struct {
+							Template struct {
+								Spec struct {
+									Containers []struct {
+										Env []struct{ Name, Value string } `json:"env"`
+									} `json:"containers"`
+								} `json:"spec"`
+							} `json:"template"`
+						} `json:"spec"`
+					} `json:"deployments"`
+				} `json:"spec"`
+			} `json:"install"`
+		} `json:"spec"`
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return 0, "", err
+	}
+	if len(v.Spec.Install.Spec.Deployments) != 1 || len(v.Spec.Install.Spec.Deployments[0].Spec.Template.Spec.Containers) != 1 {
+		return 0, "", fmt.Errorf("unexpected RHOAI CSV deployment layout")
+	}
+	for i, env := range v.Spec.Install.Spec.Deployments[0].Spec.Template.Spec.Containers[0].Env {
+		if env.Name == name {
+			return i, env.Value, nil
+		}
+	}
+	return 0, "", fmt.Errorf("CSV does not define %s", name)
+}
+func componentDevSpec(original json.RawMessage, pvc string, fsGroup int64) (json.RawMessage, error) {
+	var d map[string]any
+	if e := json.Unmarshal(original, &d); e != nil {
+		return nil, e
+	}
+	spec, ok := d["spec"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("CSV deployment lacks spec")
+	}
+	tmpl, ok := spec["template"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("CSV deployment lacks pod template")
+	}
+	pod, ok := tmpl["spec"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("CSV deployment lacks pod spec")
+	}
+	cs, ok := pod["containers"].([]any)
+	if !ok || len(cs) != 1 {
+		return nil, fmt.Errorf("expected exactly one operator container")
+	}
+	first, ok := cs[0].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("invalid operator container")
+	}
+	vols, _ := pod["volumes"].([]any)
+	mounts, _ := first["volumeMounts"].([]any)
+	spec["replicas"] = float64(1)
+	spec["strategy"] = map[string]any{"type": "Recreate"}
+	securityContext, _ := pod["securityContext"].(map[string]any)
+	if securityContext == nil {
+		securityContext = map[string]any{}
+	}
+	securityContext["fsGroup"] = float64(fsGroup)
+	pod["securityContext"] = securityContext
+	pod["volumes"] = append(vols, map[string]any{"name": "odh-pr-deploy-manifests", "persistentVolumeClaim": map[string]any{"claimName": pvc}})
+	first["volumeMounts"] = append(mounts, map[string]any{"name": "odh-pr-deploy-manifests", "mountPath": "/opt/manifests/dashboard"})
+	return json.Marshal(d)
+}
+
+func operatorSpec(b []byte) json.RawMessage {
+	var v struct {
+		Spec json.RawMessage `json:"spec"`
+	}
+	if json.Unmarshal(b, &v) != nil {
+		return nil
+	}
+	return v.Spec
+}
+func operatorHasSessionMount(b []byte, pvc string) bool {
+	var v struct {
+		Spec struct {
+			Template struct {
+				Spec struct {
+					Volumes []struct {
+						Name                  string `json:"name"`
+						PersistentVolumeClaim *struct {
+							ClaimName string `json:"claimName"`
+						} `json:"persistentVolumeClaim"`
+					} `json:"volumes"`
+					Containers []struct {
+						VolumeMounts []struct{ Name, MountPath string } `json:"volumeMounts"`
+					} `json:"containers"`
+				} `json:"spec"`
+			} `json:"template"`
+		} `json:"spec"`
+	}
+	if json.Unmarshal(b, &v) != nil {
+		return false
+	}
+	volume := false
+	for _, x := range v.Spec.Template.Spec.Volumes {
+		if x.Name == "odh-pr-deploy-manifests" && x.PersistentVolumeClaim != nil && x.PersistentVolumeClaim.ClaimName == pvc {
+			volume = true
+		}
+	}
+	if !volume {
+		return false
+	}
+	for _, c := range v.Spec.Template.Spec.Containers {
+		for _, m := range c.VolumeMounts {
+			if m.Name == "odh-pr-deploy-manifests" && m.MountPath == "/opt/manifests/dashboard" {
+				return true
+			}
+		}
+	}
+	return false
+}
+func validateManifests(dir string) error {
+	_, e := os.Stat(filepath.Join(dir, "manifests", "modules", "gen-ai", "params.env"))
+	if e != nil {
+		return fmt.Errorf("--manifests-dir must be an odh-dashboard checkout: %w", e)
+	}
+	return nil
 }

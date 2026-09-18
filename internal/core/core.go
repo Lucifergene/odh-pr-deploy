@@ -33,20 +33,30 @@ type ImageVariable struct {
 	Value   string `json:"value"`
 }
 type Session struct {
-	ID                      string        `json:"id"`
-	Context                 string        `json:"context"`
-	Namespace               string        `json:"namespace"`
-	Component               Component     `json:"component"`
-	Image                   string        `json:"image"`
-	OriginalImage           string        `json:"originalImage"`
-	OperatorNamespace       string        `json:"operatorNamespace"`
-	OperatorDeployment      string        `json:"operatorDeployment"`
-	OperatorContainer       string        `json:"operatorContainer"`
-	OperatorUID             string        `json:"operatorUID"`
-	OperatorResourceVersion string        `json:"operatorResourceVersion"`
-	OriginalVariable        ImageVariable `json:"originalVariable"`
-	DashboardURL            string        `json:"dashboardURL"`
-	Completed               bool          `json:"completed"`
+	ID                      string          `json:"id"`
+	Context                 string          `json:"context"`
+	Namespace               string          `json:"namespace"`
+	Component               Component       `json:"component"`
+	Image                   string          `json:"image"`
+	OriginalImage           string          `json:"originalImage"`
+	OperatorNamespace       string          `json:"operatorNamespace"`
+	OperatorDeployment      string          `json:"operatorDeployment"`
+	OperatorContainer       string          `json:"operatorContainer"`
+	OperatorUID             string          `json:"operatorUID"`
+	OperatorResourceVersion string          `json:"operatorResourceVersion"`
+	OriginalVariable        ImageVariable   `json:"originalVariable"`
+	DashboardURL            string          `json:"dashboardURL"`
+	CSVNamespace            string          `json:"csvNamespace"`
+	CSVName                 string          `json:"csvName"`
+	CSVOriginalDeployment   json.RawMessage `json:"csvOriginalDeployment"`
+	CSVPatchedDeployment    json.RawMessage `json:"csvPatchedDeployment"`
+	CSVResourceVersion      string          `json:"csvResourceVersion"`
+	CSVEnvIndex             int             `json:"csvEnvIndex"`
+	DSCAnnotation           string          `json:"dscAnnotation"`
+	PVCName                 string          `json:"pvcName"`
+	ManifestsDir            string          `json:"manifestsDir"`
+	OperatorOriginalSpec    json.RawMessage `json:"operatorOriginalSpec"`
+	Completed               bool            `json:"completed"`
 }
 
 func NewSessionID(component string) (string, error) {
@@ -112,4 +122,17 @@ func UnmarshalSession(b []byte) (Session, error) {
 	var s Session
 	err := json.Unmarshal(b, &s)
 	return s, err
+}
+
+// CanonicalJSON permits semantic comparison of persisted Kubernetes objects.
+func CanonicalJSON(raw []byte) []byte {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return raw
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return raw
+	}
+	return canonical
 }
