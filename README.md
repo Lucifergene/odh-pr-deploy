@@ -1,37 +1,33 @@
 # odh-pr-deploy
 
-`odh-pr-deploy` safely tests a Dashboard component PR image on an existing RHOAI cluster. It does not install or upgrade RHOAI, CatalogSources, Subscriptions, or CRDs.
+Deploy a RHOAI Dashboard PR image to a disposable OpenShift cluster using the Dashboard operator's supported `RELATED_IMAGE_*` override. The existing Dashboard URL is unchanged; after reconciliation it serves the selected PR image.
 
-## Commands
+## Safety boundary
+
+The tool changes only one image override on the discovered Dashboard operator and records its exact prior state before doing so. `cleanup` restores that state and waits for the managed workload to return to its original image. It never manages routes, clones, OGX/Llama Stack, model endpoints, Secrets, projects, or application data.
+
+Use only on a contributor-controlled disposable cluster. Do not run it against a shared production cluster.
+
+## Prerequisites
+
+- Go 1.27+, `oc`, and `gh`, authenticated to the intended cluster and GitHub.
+- Permission to get/patch the Dashboard operator Deployment and get/watch the relevant managed Deployment.
+- A successfully published Dashboard CI image for the requested PR.
+
+## Usage
 
 ```bash
-# Read only: confirm the selected component and cluster.
-odh-pr-deploy inspect --context CONTEXT
-
-# Default safe mode: create a selector-isolated, ownerless copy.
-odh-pr-deploy deploy --context CONTEXT --component gen-ai --pr PR_NUMBER
-
-# Managed mode is available only for workloads not owned by a controller.
-odh-pr-deploy deploy --context CONTEXT --component gen-ai --pr PR_NUMBER \
-  --mode managed --allow-managed-update
-
-# Switch the normal Dashboard route to an isolated PR stack after it is ready.
-odh-pr-deploy deploy --context CONTEXT --component gen-ai --pr PR_NUMBER \
-  --mode live --allow-live-traffic
-
-# For an existing Playground project, add the reversible OGX Responses API proxy.
-odh-pr-deploy prepare-ogx --session SESSION_ID --project PROJECT_NAMESPACE
-
-# Inspect and restore a session.
+odh-pr-deploy deploy --context my-spare-cluster --component gen-ai --pr 9816
+odh-pr-deploy deploy --context my-spare-cluster --component dashboard --image quay.io/example/image:tag
 odh-pr-deploy status --session SESSION_ID
 odh-pr-deploy cleanup --session SESSION_ID
 odh-pr-deploy recover
 ```
 
-`--image` accepts an explicit image reference instead of `--pr`. Every image is resolved to its registry digest before it is applied. The current version supports the `gen-ai` component; all `oc` calls require the supplied context. On this RHOAI installation, `gen-ai-ui` is owned by the Dashboard controller, so only durable `shadow` mode is permitted. This prevents a misleading transient update that the controller immediately reverts.
+Supported components are `gen-ai` and `dashboard` on RHOAI clusters with `dashboard-operator`. The applications namespace and operator location are discovered from the selected context unless `--namespace` is supplied.
 
-## Restoration guarantee
+## Verification and recovery
 
-Before a deployment mutation, the tool saves a local session under `$ODH_PR_DEPLOY_STATE_DIR` or `$HOME/.local/state/odh-pr-deploy`. Live mode records the original route, Dashboard operator replica count, and any OGX ConfigMap value changed by `prepare-ogx`. `cleanup` refuses to overwrite values changed by another actor, restores the recorded values, and deletes only session-created resources. Controller-owned workloads are refused before mutation.
+`deploy` verifies operator rollout, managed workload image digest, and availability. For a Playground PR, use a separately managed disposable test project and call the BFF Responses API with an OpenShift access token; browser testing is optional for UI-specific changes.
 
-Shadow cleanup deletes only the tool-created Deployment and first confirms that the source managed deployment still has its original image.
+If a terminal closes after deployment, run `recover` to identify unfinished sessions, then `cleanup --session`. Cleanup refuses to overwrite an image override changed by another actor.
