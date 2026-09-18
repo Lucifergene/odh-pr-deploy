@@ -1,37 +1,37 @@
 # odh-pr-deploy
 
-`odh-pr-deploy` safely tests a Dashboard component PR image on an existing RHOAI cluster. It does not install or upgrade RHOAI, CatalogSources, Subscriptions, or CRDs.
+Deploy a compatible GenAI Dashboard PR stack to a disposable OpenShift cluster through the RHOAI operator's `RELATED_IMAGE_*` inputs. The existing Dashboard URL is unchanged; normal operator reconciliation serves the selected PR images.
 
-## Commands
+## Safety boundary
+
+The tool changes exactly two image values in the installed RHOAI operator CSV—GenAI and its matching Dashboard host—and adds one unique DataScienceCluster reconciliation annotation. It records both exact prior values before mutation. `cleanup` refuses concurrent changes, restores both values atomically, removes only its own annotation, and waits for both managed workloads to return to their original images.
+
+It never manages routes, clones, OGX/Llama Stack, model endpoints, Secrets, projects, application data, or cluster RBAC. Missing application prerequisites are reported by the application, not repaired by this tool.
+
+Use only on a contributor-controlled disposable cluster. Do not run it against a shared production cluster.
+
+## Prerequisites
+
+- Go 1.27+, `oc`, and `gh`, authenticated to the intended cluster and GitHub.
+- Permission to get/patch the installed RHOAI operator CSV, create/delete a Lease in that namespace, annotate `default-dsc`, and get/watch the `gen-ai-ui` and `rhods-dashboard` Deployments.
+- A successfully published Dashboard CI image for the requested PR.
+
+## Usage
 
 ```bash
-# Read only: confirm the selected component and cluster.
-odh-pr-deploy inspect --context CONTEXT
-
-# Default safe mode: create a selector-isolated, ownerless copy.
-odh-pr-deploy deploy --context CONTEXT --component gen-ai --pr PR_NUMBER
-
-# Managed mode is available only for workloads not owned by a controller.
-odh-pr-deploy deploy --context CONTEXT --component gen-ai --pr PR_NUMBER \
-  --mode managed --allow-managed-update
-
-# Switch the normal Dashboard route to an isolated PR stack after it is ready.
-odh-pr-deploy deploy --context CONTEXT --component gen-ai --pr PR_NUMBER \
-  --mode live --allow-live-traffic
-
-# For an existing Playground project, add the reversible OGX Responses API proxy.
-odh-pr-deploy prepare-ogx --session SESSION_ID --project PROJECT_NAMESPACE
-
-# Inspect and restore a session.
+odh-pr-deploy inspect --context my-spare-cluster
+odh-pr-deploy deploy --context my-spare-cluster --pr 9816
+odh-pr-deploy deploy --context my-spare-cluster \
+  --image quay.io/example/gen-ai:pr --dashboard-image quay.io/example/dashboard:pr
 odh-pr-deploy status --session SESSION_ID
 odh-pr-deploy cleanup --session SESSION_ID
 odh-pr-deploy recover
 ```
 
-`--image` accepts an explicit image reference instead of `--pr`. Every image is resolved to its registry digest before it is applied. The current version supports the `gen-ai` component; all `oc` calls require the supplied context. On this RHOAI installation, `gen-ai-ui` is owned by the Dashboard controller, so only durable `shadow` mode is permitted. This prevents a misleading transient update that the controller immediately reverts.
+`--pr` resolves both images from the same PR head SHA and pins their registry digests before cluster mutation. Custom GenAI images require an explicit matching Dashboard image. The applications namespace is discovered from the selected context unless `--namespace` is supplied. The tool fails closed when the expected RHOAI Subscription, CSV image inputs, or workloads are ambiguous or unavailable.
 
-## Restoration guarantee
+## Verification and recovery
 
-Before a deployment mutation, the tool saves a local session under `$ODH_PR_DEPLOY_STATE_DIR` or `$HOME/.local/state/odh-pr-deploy`. Live mode records the original route, Dashboard operator replica count, and any OGX ConfigMap value changed by `prepare-ogx`. `cleanup` refuses to overwrite values changed by another actor, restores the recorded values, and deletes only session-created resources. Controller-owned workloads are refused before mutation.
+`deploy` verifies the operator rollout, both managed workload digests, and availability. It does not perform browser or application/API smoke tests.
 
-Shadow cleanup deletes only the tool-created Deployment and first confirms that the source managed deployment still has its original image.
+If a terminal closes after deployment, run `recover` to identify unfinished sessions, then `cleanup --session`. Cleanup refuses to overwrite an image override changed by another actor.

@@ -2,93 +2,128 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/akundu/odh-pr-deploy/internal/core"
 )
 
-type fakeRunner struct {
-	calls []string
-	data  map[string]string
-}
-
-func (r *fakeRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
-	call := name + " " + strings.Join(args, " ")
-	r.calls = append(r.calls, call)
-	for key, value := range r.data {
-		if strings.Contains(call, key) {
-			return []byte(value), nil
-		}
-	}
-	return nil, nil
-}
-
-func TestShadowDeployScopesAllOCCommandsAndCreatesOwnerlessClone(t *testing.T) {
-	runner := &fakeRunner{data: map[string]string{
-		"image info":                      `{"digest":"sha256:deadbeef"}`,
-		"get deployment gen-ai-ui":        `{"metadata":{"name":"gen-ai-ui","namespace":"ns","labels":{"platform.opendatahub.io/part-of":"dashboard"}},"spec":{"selector":{"matchLabels":{"app":"gen-ai-ui"}},"template":{"metadata":{"labels":{"app":"gen-ai-ui"}},"spec":{"containers":[{"name":"gen-ai-ui","image":"original"}]}}}}`,
-		"get clusterversion version":      `{"status":{"desired":{"version":"4.22.13"}}}`,
-		"get dashboard default-dashboard": `{"metadata":{"annotations":{"platform.opendatahub.io/version":"3.5.0"}}}`,
-	}}
-	tool := New(runner, t.TempDir())
-	session, err := tool.Deploy(context.Background(), DeployOptions{Context: "ctx", Namespace: "ns", Component: "gen-ai", Image: "quay.io/example:pr", Mode: "shadow"})
+func TestCSVImageVariablesFindsBothRequiredInputs(t *testing.T) {
+	csv := []byte(`{"metadata":{"resourceVersion":"7"},"spec":{"install":{"spec":{"deployments":[{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"RELATED_IMAGE_ODH_DASHBOARD_IMAGE","value":"dashboard-old"},{"name":"RELATED_IMAGE_ODH_MOD_ARCH_GEN_AI_IMAGE","value":"genai-old"}]}]}}}}]}}}}`)
+	values, rv, err := csvImageVariables(csv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if session.ShadowDeployment == "" {
-		t.Fatal("expected shadow deployment name")
-	}
-	if session.ClusterVersion != "4.22.13" || session.RHOAIVersion != "3.5.0" {
-		t.Fatalf("session did not retain cluster baseline: %#v", session)
-	}
-	if !contains(runner.calls, "oc --context ctx -n ns apply -f ") {
-		t.Fatalf("missing scoped apply: %#v", runner.calls)
-	}
-	for _, call := range runner.calls {
-		if strings.HasPrefix(call, "oc ") && !strings.Contains(call, "--context ctx") {
-			t.Fatalf("unscoped oc command: %s", call)
-		}
+	if rv != "7" || values["RELATED_IMAGE_ODH_DASHBOARD_IMAGE"].Value != "dashboard-old" || values["RELATED_IMAGE_ODH_MOD_ARCH_GEN_AI_IMAGE"].Value != "genai-old" {
+		t.Fatalf("unexpected discovery: %#v, %q", values, rv)
 	}
 }
 
-func TestManagedCleanupRefusesWhenOverrideChanged(t *testing.T) {
-	runner := &fakeRunner{data: map[string]string{
-		"get deployment gen-ai-ui": `{"spec":{"template":{"spec":{"containers":[{"name":"gen-ai-ui","image":"quay.io/someone-else:pr"}]}}}}`,
-	}}
-	tool := New(runner, t.TempDir())
-	session := Session{ID: "s", Mode: "managed", Context: "ctx", Namespace: "ns", Component: core.Component{Name: "gen-ai", Deployment: "gen-ai-ui", Container: "gen-ai-ui"}, Image: "quay.io/ours:pr", OriginalImage: "original"}
-	if err := tool.Save(session); err != nil {
+func TestPairedCSVPatchGuardsAndReplacesBothImages(t *testing.T) {
+	values := map[string]csvImageValue{"RELATED_IMAGE_ODH_DASHBOARD_IMAGE": {Index: 0, Value: "dashboard-old"}, "RELATED_IMAGE_ODH_MOD_ARCH_GEN_AI_IMAGE": {Index: 1, Value: "genai-old"}}
+	patch, err := pairedCSVPatch("7", values, map[string]string{"RELATED_IMAGE_ODH_DASHBOARD_IMAGE": "dashboard-new", "RELATED_IMAGE_ODH_MOD_ARCH_GEN_AI_IMAGE": "genai-new"})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tool.Cleanup(context.Background(), "s"); err == nil || !strings.Contains(err.Error(), "refusing cleanup") {
-		t.Fatalf("expected concurrent-change refusal, got %v", err)
+	var operations []map[string]any
+	if err := json.Unmarshal(patch, &operations); err != nil {
+		t.Fatal(err)
 	}
-	if contains(runner.calls, " patch ") {
-		t.Fatalf("cleanup must not patch after concurrent change: %#v", runner.calls)
+	if len(operations) != 5 {
+		t.Fatalf("got %d operations, want 5", len(operations))
 	}
-}
-
-func TestManagedDeployRefusesControllerOwnedWorkload(t *testing.T) {
-	runner := &fakeRunner{data: map[string]string{
-		"image info":               `{"digest":"sha256:deadbeef"}`,
-		"get deployment gen-ai-ui": `{"metadata":{"ownerReferences":[{"controller":true,"kind":"Dashboard"}]},"spec":{"template":{"spec":{"containers":[{"name":"gen-ai-ui","image":"original"}]}}}}`,
-	}}
-	tool := New(runner, t.TempDir())
-	_, err := tool.Deploy(context.Background(), DeployOptions{Context: "ctx", Namespace: "ns", Component: "gen-ai", Image: "quay.io/example:pr", Mode: "managed", AllowManaged: true})
-	if err == nil || !strings.Contains(err.Error(), "controller-owned") {
-		t.Fatalf("expected controller-owned refusal, got %v", err)
+	if operations[0]["op"] != "test" || operations[0]["path"] != "/metadata/resourceVersion" {
+		t.Fatalf("missing resource version guard: %#v", operations[0])
 	}
-	if contains(runner.calls, " patch ") {
-		t.Fatalf("managed mode must not patch controller-owned workloads: %#v", runner.calls)
+	if operations[2]["value"] != "dashboard-new" || operations[4]["value"] != "genai-new" {
+		t.Fatalf("did not replace both images: %#v", operations)
 	}
 }
 
-func contains(calls []string, part string) bool {
-	for _, call := range calls {
-		if strings.Contains(call, part) {
-			return true
+type deployRunner struct {
+	calls   []string
+	patched bool
+}
+
+func (r *deployRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+	call := name + " " + strings.Join(args, " ")
+	r.calls = append(r.calls, call)
+	if name == "gh" {
+		return []byte("abc123\n"), nil
+	}
+	if strings.Contains(call, "get subscription -A") {
+		return []byte(`{"items":[{"metadata":{"namespace":"operators","name":"rhods-operator"},"status":{"installedCSV":"rhods.v1"}}]}`), nil
+	}
+	if strings.Contains(call, "get csv rhods.v1") {
+		return []byte(`{"metadata":{"resourceVersion":"7"},"spec":{"install":{"spec":{"deployments":[{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"RELATED_IMAGE_ODH_DASHBOARD_IMAGE","value":"dashboard-old"},{"name":"RELATED_IMAGE_ODH_MOD_ARCH_GEN_AI_IMAGE","value":"genai-old"}]}]}}}}]}}}}`), nil
+	}
+	if strings.Contains(call, "patch csv rhods.v1") {
+		r.patched = true
+		return nil, nil
+	}
+	if strings.Contains(call, "image info") {
+		return []byte(`{"digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`), nil
+	}
+	if strings.Contains(call, "get deployment -A") {
+		return []byte(`{"items":[{"metadata":{"namespace":"apps","name":"gen-ai-ui"}}]}`), nil
+	}
+	if strings.Contains(call, "get deployment gen-ai-ui") {
+		image := "genai-old"
+		if r.patched {
+			image = "quay.io/opendatahub/odh-mod-arch-gen-ai@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 		}
+		return []byte(`{"spec":{"template":{"spec":{"containers":[{"name":"gen-ai-ui","image":"` + image + `"}]}}}}`), nil
 	}
-	return false
+	if strings.Contains(call, "get deployment rhods-dashboard") {
+		image := "dashboard-old"
+		if r.patched {
+			image = "quay.io/opendatahub/odh-dashboard@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+		}
+		return []byte(`{"spec":{"template":{"spec":{"containers":[{"name":"rhods-dashboard","image":"` + image + `"}]}}}}`), nil
+	}
+	return nil, nil
+}
+func TestDeployChangesBothImagesInOneGuardedCSVTransaction(t *testing.T) {
+	r := &deployRunner{}
+	tool := New(r, t.TempDir())
+	s, err := tool.Deploy(context.Background(), DeployOptions{Context: "ctx", PR: 9816})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Overrides) != 2 || !r.patched {
+		t.Fatalf("deployment did not persist paired stack: %#v", s)
+	}
+	joined := strings.Join(r.calls, "\n")
+	if !strings.Contains(joined, "odh-dashboard@sha256:") || !strings.Contains(joined, "odh-mod-arch-gen-ai@sha256:") {
+		t.Fatalf("CSV patch omitted a stack image: %s", joined)
+	}
+}
+
+type cleanupRunner struct{ calls []string }
+
+func (r *cleanupRunner) Run(_ context.Context, name string, args ...string) ([]byte, error) {
+	call := name + " " + strings.Join(args, " ")
+	r.calls = append(r.calls, call)
+	if strings.Contains(call, "get csv rhods.v1") {
+		return []byte(`{"metadata":{"resourceVersion":"7"},"spec":{"install":{"spec":{"deployments":[{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"RELATED_IMAGE_ODH_DASHBOARD_IMAGE","value":"dashboard-old"},{"name":"RELATED_IMAGE_ODH_MOD_ARCH_GEN_AI_IMAGE","value":"genai-old"}]}]}}}}]}}}}`), nil
+	}
+	return nil, nil
+}
+func TestCleanupAlreadyRestoredRemovesOnlyItsAnnotation(t *testing.T) {
+	r := &cleanupRunner{}
+	tool := New(r, t.TempDir())
+	s := Session{ID: "genai-stack-1234567890abcdef", Context: "ctx", CSVNamespace: "operators", CSVName: "rhods.v1", Annotation: "odh-pr-deploy.openshift.io/reconcile-test", Overrides: []core.ImageOverride{
+		{Component: core.Component{Name: "gen-ai", ImageEnv: "RELATED_IMAGE_ODH_MOD_ARCH_GEN_AI_IMAGE"}, Image: "genai-new", OriginalCSVValue: "genai-old"},
+		{Component: core.Component{Name: "dashboard", ImageEnv: "RELATED_IMAGE_ODH_DASHBOARD_IMAGE"}, Image: "dashboard-new", OriginalCSVValue: "dashboard-old"},
+	}}
+	if err := tool.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := tool.Cleanup(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(r.calls, "\n"), "annotate datasciencecluster default-dsc odh-pr-deploy.openshift.io/reconcile-test-") {
+		t.Fatal("cleanup left the tool annotation after an already-restored stack")
+	}
 }

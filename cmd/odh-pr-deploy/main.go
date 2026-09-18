@@ -5,184 +5,105 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/akundu/odh-pr-deploy/internal/app"
 	"os"
 	"path/filepath"
-
-	"github.com/akundu/odh-pr-deploy/internal/app"
 )
 
 func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+	if e := run(os.Args[1:]); e != nil {
+		fmt.Fprintln(os.Stderr, "error:", e)
 		os.Exit(1)
 	}
 }
-
-func run(args []string) error {
-	if len(args) == 0 {
+func run(a []string) error {
+	if len(a) == 0 {
 		return usage()
 	}
-	stateDir := defaultStateDir()
-	command := args[0]
-	switch command {
+	d := stateDir()
+	t := app.New(app.OSRunner{}, d)
+	switch a[0] {
 	case "inspect":
-		fs := flag.NewFlagSet(command, flag.ContinueOnError)
-		contextName, namespace, component := commonFlags(fs, &stateDir)
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
+		f := flag.NewFlagSet("inspect", flag.ContinueOnError)
+		ctx := f.String("context", "", "Kubernetes context")
+		ns := f.String("namespace", "", "Dashboard applications namespace; auto-discovered by default")
+		if e := f.Parse(a[1:]); e != nil {
+			return e
 		}
-		return inspect(*contextName, *namespace, *component)
+		s, e := t.Inspect(context.Background(), *ctx, *ns)
+		if e != nil {
+			return e
+		}
+		return output(s)
 	case "deploy":
-		fs := flag.NewFlagSet(command, flag.ContinueOnError)
-		contextName, namespace, component := commonFlags(fs, &stateDir)
-		image := fs.String("image", "", "immutable image reference")
-		pr := fs.Int("pr", 0, "GitHub PR number")
-		mode := fs.String("mode", "stack", "stack, shadow, managed, or live")
-		hostImage := fs.String("host-image", "", "Dashboard host image; defaults to the matching PR image")
-		allowManaged := fs.Bool("allow-managed-update", false, "acknowledge mutation of the managed Dashboard component")
-		allowLive := fs.Bool("allow-live-traffic", false, "required to switch rh-ai to the isolated test stack")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
+		f := flag.NewFlagSet("deploy", flag.ContinueOnError)
+		ctx := f.String("context", "", "Kubernetes context")
+		ns := f.String("namespace", "", "Dashboard applications namespace; auto-discovered by default")
+		image := f.String("image", "", "GenAI image override; requires --dashboard-image")
+		dashboardImage := f.String("dashboard-image", "", "Dashboard image override; requires --image")
+		pr := f.Int("pr", 0, "odh-dashboard PR number")
+		if e := f.Parse(a[1:]); e != nil {
+			return e
 		}
-		tool := app.New(app.OSRunner{}, stateDir)
-		session, err := tool.Deploy(context.Background(), app.DeployOptions{Context: *contextName, Namespace: *namespace, Component: *component, Image: *image, PR: *pr, Mode: *mode, HostImage: *hostImage, AllowManaged: *allowManaged, AllowLive: *allowLive})
-		if err != nil {
-			return err
+		s, e := t.Deploy(context.Background(), app.DeployOptions{Context: *ctx, Namespace: *ns, Image: *image, DashboardImage: *dashboardImage, PR: *pr})
+		if e != nil {
+			return e
 		}
-		return printJSON(session)
-	case "status":
-		fs := flag.NewFlagSet(command, flag.ContinueOnError)
-		fs.StringVar(&stateDir, "state-dir", stateDir, "session state directory")
-		id := fs.String("session", "", "session ID")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if *id == "" {
-			return fmt.Errorf("--session is required")
-		}
-		session, err := app.New(app.OSRunner{}, stateDir).Load(*id)
-		if err != nil {
-			return err
-		}
-		return printJSON(session)
-	case "activate":
-		fs := flag.NewFlagSet(command, flag.ContinueOnError)
-		fs.StringVar(&stateDir, "state-dir", stateDir, "session state directory")
-		id := fs.String("session", "", "session ID")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if *id == "" {
-			return fmt.Errorf("--session is required")
-		}
-		if err := app.New(app.OSRunner{}, stateDir).ActivateLive(context.Background(), *id); err != nil {
-			return err
-		}
-		fmt.Printf("session %s is serving the live rh-ai route\n", *id)
-		return nil
-	case "prepare-ogx":
-		fs := flag.NewFlagSet(command, flag.ContinueOnError)
-		fs.StringVar(&stateDir, "state-dir", stateDir, "session state directory")
-		id := fs.String("session", "", "session ID")
-		project := fs.String("project", "", "data-science project namespace")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
-		}
-		if *id == "" || *project == "" {
-			return fmt.Errorf("--session and --project are required")
-		}
-		return app.New(app.OSRunner{}, stateDir).PrepareOGXPassthrough(context.Background(), *id, *project)
+		return output(s)
 	case "cleanup":
-		fs := flag.NewFlagSet(command, flag.ContinueOnError)
-		fs.StringVar(&stateDir, "state-dir", stateDir, "session state directory")
-		id := fs.String("session", "", "session ID")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
+		f := flag.NewFlagSet("cleanup", flag.ContinueOnError)
+		id := f.String("session", "", "session ID")
+		if e := f.Parse(a[1:]); e != nil {
+			return e
 		}
 		if *id == "" {
 			return fmt.Errorf("--session is required")
 		}
-		if err := app.New(app.OSRunner{}, stateDir).Cleanup(context.Background(), *id); err != nil {
-			return err
+		if e := t.Cleanup(context.Background(), *id); e != nil {
+			return e
 		}
-		fmt.Printf("session %s restored successfully\n", *id)
+		fmt.Println("restored successfully")
 		return nil
+	case "status":
+		f := flag.NewFlagSet("status", flag.ContinueOnError)
+		id := f.String("session", "", "session ID")
+		if e := f.Parse(a[1:]); e != nil {
+			return e
+		}
+		s, e := t.Load(*id)
+		if e != nil {
+			return e
+		}
+		return output(s)
 	case "recover":
-		fs := flag.NewFlagSet(command, flag.ContinueOnError)
-		fs.StringVar(&stateDir, "state-dir", stateDir, "session state directory")
-		if err := fs.Parse(args[1:]); err != nil {
-			return err
+		ss, e := t.Sessions()
+		if e != nil {
+			return e
 		}
-		sessions, err := app.New(app.OSRunner{}, stateDir).Sessions()
-		if err != nil {
-			return err
-		}
-		for _, session := range sessions {
-			if !session.Completed {
-				fmt.Println(session.ID)
+		for _, s := range ss {
+			if !s.Completed {
+				fmt.Println(s.ID)
 			}
 		}
 		return nil
-	default:
-		return usage()
 	}
+	return usage()
 }
-
-func commonFlags(fs *flag.FlagSet, stateDir *string) (*string, *string, *string) {
-	contextName := fs.String("context", "", "required Kubernetes context")
-	namespace := fs.String("namespace", "redhat-ods-applications", "target namespace")
-	component := fs.String("component", "gen-ai", "Dashboard component")
-	fs.StringVar(stateDir, "state-dir", *stateDir, "session state directory")
-	return contextName, namespace, component
-}
-
-func inspect(contextName, namespace, component string) error {
-	if contextName == "" {
-		return fmt.Errorf("--context is required")
+func stateDir() string {
+	if d := os.Getenv("ODH_PR_DEPLOY_STATE_DIR"); d != "" {
+		return d
 	}
-	if component != "gen-ai" {
-		return fmt.Errorf("unsupported component %q (supported: gen-ai)", component)
-	}
-	// Use direct read-only invocations; inspection never persists a session.
-	runner := app.OSRunner{}
-	version, err := runner.Run(context.Background(), "oc", "--context", contextName, "get", "clusterversion", "version", "-o", "json")
-	if err != nil {
-		return err
-	}
-	deployment, err := runner.Run(context.Background(), "oc", "--context", contextName, "-n", namespace, "get", "deployment", componentDeployment(component), "-o", "json")
-	if err != nil {
-		return err
-	}
-	return printJSON(map[string]json.RawMessage{"clusterVersion": version, "deployment": deployment})
-}
-
-func componentDeployment(component string) string {
-	if component == "gen-ai" {
-		return "gen-ai-ui"
-	}
-	return component
-}
-
-func defaultStateDir() string {
-	if configured := os.Getenv("ODH_PR_DEPLOY_STATE_DIR"); configured != "" {
-		return configured
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
+	h, e := os.UserHomeDir()
+	if e != nil {
 		return ".odh-pr-deploy"
 	}
-	return filepath.Join(home, ".local", "state", "odh-pr-deploy")
+	return filepath.Join(h, ".local", "state", "odh-pr-deploy")
 }
-
-func printJSON(value any) error {
-	data, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return err
+func output(v any) error {
+	b, e := json.MarshalIndent(v, "", "  ")
+	if e == nil {
+		fmt.Println(string(b))
 	}
-	fmt.Println(string(data))
-	return nil
+	return e
 }
-
-func usage() error {
-	return fmt.Errorf("usage: odh-pr-deploy <inspect|deploy|activate|prepare-ogx|status|cleanup|recover> [flags]")
-}
+func usage() error { return fmt.Errorf("usage: odh-pr-deploy <inspect|deploy|cleanup|status|recover>") }
