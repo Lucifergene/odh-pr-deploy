@@ -23,17 +23,29 @@ func run(a []string) error {
 	d := stateDir()
 	t := app.New(app.OSRunner{}, d)
 	switch a[0] {
+	case "inspect":
+		f := flag.NewFlagSet("inspect", flag.ContinueOnError)
+		ctx := f.String("context", "", "Kubernetes context")
+		ns := f.String("namespace", "", "Dashboard applications namespace; auto-discovered by default")
+		if e := f.Parse(a[1:]); e != nil {
+			return e
+		}
+		s, e := t.Inspect(context.Background(), *ctx, *ns)
+		if e != nil {
+			return e
+		}
+		return output(s)
 	case "deploy":
 		f := flag.NewFlagSet("deploy", flag.ContinueOnError)
 		ctx := f.String("context", "", "Kubernetes context")
 		ns := f.String("namespace", "", "Dashboard applications namespace; auto-discovered by default")
-		component := f.String("component", "gen-ai", "gen-ai or dashboard")
-		image := f.String("image", "", "image override")
+		image := f.String("image", "", "GenAI image override; requires --dashboard-image")
+		dashboardImage := f.String("dashboard-image", "", "Dashboard image override; requires --image")
 		pr := f.Int("pr", 0, "odh-dashboard PR number")
 		if e := f.Parse(a[1:]); e != nil {
 			return e
 		}
-		s, e := t.Deploy(context.Background(), app.DeployOptions{Context: *ctx, Namespace: *ns, Component: *component, Image: *image, PR: *pr})
+		s, e := t.Deploy(context.Background(), app.DeployOptions{Context: *ctx, Namespace: *ns, Image: *image, DashboardImage: *dashboardImage, PR: *pr})
 		if e != nil {
 			return e
 		}
@@ -94,4 +106,4 @@ func output(v any) error {
 	}
 	return e
 }
-func usage() error { return fmt.Errorf("usage: odh-pr-deploy <deploy|cleanup|status|recover>") }
+func usage() error { return fmt.Errorf("usage: odh-pr-deploy <inspect|deploy|cleanup|status|recover>") }

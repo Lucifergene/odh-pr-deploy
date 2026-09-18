@@ -1,33 +1,37 @@
 # odh-pr-deploy
 
-Deploy a RHOAI Dashboard PR image to a disposable OpenShift cluster through the RHOAI operator's `RELATED_IMAGE_*` input. The existing Dashboard URL is unchanged; normal operator reconciliation serves the selected PR image.
+Deploy a compatible GenAI Dashboard PR stack to a disposable OpenShift cluster through the RHOAI operator's `RELATED_IMAGE_*` inputs. The existing Dashboard URL is unchanged; normal operator reconciliation serves the selected PR images.
 
 ## Safety boundary
 
-The tool changes only one image value in the installed RHOAI operator CSV and adds a unique DataScienceCluster reconciliation annotation. It records the exact prior image before doing so. `cleanup` refuses concurrent changes, restores that value, removes only its own annotation, and waits for the managed workload to return to its original image. It never manages routes, clones, OGX/Llama Stack, model endpoints, Secrets, projects, or application data.
+The tool changes exactly two image values in the installed RHOAI operator CSV—GenAI and its matching Dashboard host—and adds one unique DataScienceCluster reconciliation annotation. It records both exact prior values before mutation. `cleanup` refuses concurrent changes, restores both values atomically, removes only its own annotation, and waits for both managed workloads to return to their original images.
+
+It never manages routes, clones, OGX/Llama Stack, model endpoints, Secrets, projects, application data, or cluster RBAC. Missing application prerequisites are reported by the application, not repaired by this tool.
 
 Use only on a contributor-controlled disposable cluster. Do not run it against a shared production cluster.
 
 ## Prerequisites
 
 - Go 1.27+, `oc`, and `gh`, authenticated to the intended cluster and GitHub.
-- Permission to get/patch the installed RHOAI operator CSV, annotate `default-dsc`, and get/watch the relevant managed Deployment.
+- Permission to get/patch the installed RHOAI operator CSV, create/delete a Lease in that namespace, annotate `default-dsc`, and get/watch the `gen-ai-ui` and `rhods-dashboard` Deployments.
 - A successfully published Dashboard CI image for the requested PR.
 
 ## Usage
 
 ```bash
-odh-pr-deploy deploy --context my-spare-cluster --component gen-ai --pr 9816
-odh-pr-deploy deploy --context my-spare-cluster --component dashboard --image quay.io/example/image:tag
+odh-pr-deploy inspect --context my-spare-cluster
+odh-pr-deploy deploy --context my-spare-cluster --pr 9816
+odh-pr-deploy deploy --context my-spare-cluster \
+  --image quay.io/example/gen-ai:pr --dashboard-image quay.io/example/dashboard:pr
 odh-pr-deploy status --session SESSION_ID
 odh-pr-deploy cleanup --session SESSION_ID
 odh-pr-deploy recover
 ```
 
-Supported components are `gen-ai` and `dashboard` on RHOAI clusters. The applications namespace is discovered from the selected context unless `--namespace` is supplied.
+`--pr` resolves both images from the same PR head SHA and pins their registry digests before cluster mutation. Custom GenAI images require an explicit matching Dashboard image. The applications namespace is discovered from the selected context unless `--namespace` is supplied. The tool fails closed when the expected RHOAI Subscription, CSV image inputs, or workloads are ambiguous or unavailable.
 
 ## Verification and recovery
 
-`deploy` verifies operator rollout, managed workload image digest, and availability. For a Playground PR, use a separately managed disposable test project and call the BFF Responses API with an OpenShift access token; browser testing is optional for UI-specific changes.
+`deploy` verifies the operator rollout, both managed workload digests, and availability. It does not perform browser or application/API smoke tests.
 
 If a terminal closes after deployment, run `recover` to identify unfinished sessions, then `cleanup --session`. Cleanup refuses to overwrite an image override changed by another actor.

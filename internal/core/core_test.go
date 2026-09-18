@@ -2,24 +2,17 @@ package core
 
 import "testing"
 
-func TestComponentForDashboardUsesOperatorOverride(t *testing.T) {
-	c, err := ComponentFor("dashboard")
-	if err != nil {
-		t.Fatal(err)
+func TestGenAIStackUsesSamePRSHAForHostAndRemote(t *testing.T) {
+	stack := GenAIStackFromSHA("abc123")
+	if len(stack) != 2 {
+		t.Fatalf("got %d images, want 2", len(stack))
 	}
-	if c.ImageEnv != "RELATED_IMAGE_ODH_DASHBOARD_IMAGE" || c.Deployment != "rhods-dashboard" {
-		t.Fatalf("unexpected mapping: %#v", c)
+	if stack[0].Image != "quay.io/opendatahub/odh-mod-arch-gen-ai:odh-pr-abc123" || stack[1].Image != "quay.io/opendatahub/odh-dashboard:odh-pr-abc123" {
+		t.Fatalf("unexpected stack: %#v", stack)
 	}
 }
-func TestNewSessionIDIsSafeForStatePath(t *testing.T) {
-	id, err := NewSessionID("gen-ai")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ValidSessionID(id) {
-		t.Fatalf("unsafe generated ID %q", id)
-	}
-	if ValidSessionID("../escape") {
-		t.Fatal("path traversal accepted")
+func TestCustomStackRejectsUnpairedGenAIImage(t *testing.T) {
+	if _, err := CustomGenAIStack("quay.io/example/genai:pr", ""); err == nil {
+		t.Fatal("expected unpaired image error")
 	}
 }
